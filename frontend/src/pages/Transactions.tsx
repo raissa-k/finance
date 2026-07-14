@@ -204,11 +204,6 @@ export function Transactions() {
     diff: number;
     payloads: any[];
   } | null>(null);
-  const [reconcileDuplicates, setReconcileDuplicates] = useState<{
-    csvDuplicates: any[];
-    dbMatches: any[];
-  }>({ csvDuplicates: [], dbMatches: [] });
-
   // Import Wizard State
   const [importWizardItems, setImportWizardItems] = useState<any[]>([]);
   const [currentWizardIndex, setCurrentWizardIndex] = useState<number>(-1);
@@ -783,67 +778,6 @@ export function Transactions() {
     }
   };
 
-  const detectSameDayOccurrences = async (payloads: any[]) => {
-    if (payloads.length === 0) return { csvDuplicates: [], dbMatches: [] };
-
-    // 1. Group by cash date and amount to find identical same-day transactions in the CSV
-    const csvGroups: { [key: string]: any[] } = {};
-    payloads.forEach(p => {
-      const dateStr = p.cash;
-      const amt = Math.round(p.amount * 100) / 100;
-      const key = `${dateStr}_${amt}`;
-      if (!csvGroups[key]) csvGroups[key] = [];
-      csvGroups[key].push(p);
-    });
-
-    const csvDuplicates: any[] = [];
-    Object.values(csvGroups).forEach(group => {
-      if (group.length > 1) {
-        csvDuplicates.push(...group);
-      }
-    });
-
-    // 2. Query database for existing transactions in the date range of this import
-    const dates = payloads.map(p => p.cash).filter(Boolean);
-    if (dates.length === 0) {
-      return { csvDuplicates, dbMatches: [] };
-    }
-    dates.sort();
-    const minDate = dates[0];
-    const maxDate = dates[dates.length - 1];
-
-    const dbMatches: any[] = [];
-    try {
-      const response = await api.get(`/accounts/${accountId}/transactions/`, {
-        params: {
-          start_date: minDate,
-          end_date: maxDate,
-          page_size: 5000
-        }
-      });
-      const dbTxs = response.data.results || [];
-
-      // Check if imported transactions match any database transaction on date and amount
-      payloads.forEach(p => {
-        const pAmt = Math.round(p.amount * 100) / 100;
-        const matchedDbTx = dbTxs.find((dbTx: any) => {
-          const dbAmt = Math.round(dbTx.amount * 100) / 100;
-          return dbTx.cash === p.cash && dbAmt === pAmt;
-        });
-        if (matchedDbTx) {
-          dbMatches.push({
-            payload: p,
-            dbTransaction: matchedDbTx
-          });
-        }
-      });
-    } catch (err) {
-      console.error('Error fetching db transactions for duplicate detection:', err);
-    }
-
-    return { csvDuplicates, dbMatches };
-  };
-
   const commitImportBatch = async (items: any[]) => {
     setImportLoading(true);
     try {
@@ -879,9 +813,6 @@ export function Transactions() {
         const roundedEndVal = Math.round(endVal * 100) / 100;
         const diff = Math.round((roundedEndVal - expectedEnd) * 100) / 100;
         if (Math.abs(diff) > 0.01) {
-          const duplicates = await detectSameDayOccurrences(payloads);
-          setReconcileDuplicates(duplicates);
-
           setReconcileWarningDetails({
             start: startVal,
             end: endVal,
@@ -945,6 +876,54 @@ export function Transactions() {
   };
 
   // ---- Bulk import review grid ----
+
+  // Match key: date + amount + normalized description. Requiring the
+  // description too (not just date+amount) avoids false positives like two
+  // unrelated same-amount purchases on the same day, while still reliably
+  // catching the real case: re-importing the same or an overlapping
+  // statement, where the bank's description text is byte-identical.
+  const dedupKey = (date: string, amount: number, comment: string) =>
+    `${date}|${Math.round(amount * 100)}|${(comment || '').trim().toLowerCase()}`;
+
+  // Flags rows that look like duplicates — either of another row in this
+  // same import batch (e.g. overlapping file date ranges) or of a
+  // transaction already saved in this account. Duplicates default to
+  // unchecked (excluded) so nothing gets silently double-imported; the user
+  // can still re-include a flagged row if it's a false positive.
+  const flagDuplicateRows = async (rows: any[]): Promise<any[]> => {
+    const dates = rows.map(r => r.date).filter(Boolean);
+    let existingKeys = new Set<string>();
+    if (dates.length > 0 && accountId) {
+      dates.sort();
+      try {
+        const response = await api.get(`/accounts/${accountId}/transactions/`, {
+          params: { start_date: dates[0], end_date: dates[dates.length - 1], page_size: 5000 },
+        });
+        const dbTxs = response.data.results || [];
+        existingKeys = new Set(
+          dbTxs.map((t: any) => dedupKey(t.cash, t.amount, t.comment || ''))
+        );
+      } catch (err) {
+        console.error('Error fetching existing transactions for duplicate detection:', err);
+      }
+    }
+
+    const seenInBatch = new Set<string>();
+    return rows.map(row => {
+      const key = dedupKey(row.date, row.amount, row.comments);
+      let isDuplicate = false;
+      let duplicateReason = '';
+      if (existingKeys.has(key)) {
+        isDuplicate = true;
+        duplicateReason = 'Already imported — matches an existing transaction in this account';
+      } else if (seenInBatch.has(key)) {
+        isDuplicate = true;
+        duplicateReason = 'Duplicate of another row in this import (same date, amount & description)';
+      }
+      seenInBatch.add(key);
+      return { ...row, isDuplicate, duplicateReason, include: !isDuplicate };
+    });
+  };
 
   const categoryFullName = (categoryId: number | null): string => {
     if (!categoryId) return '';
@@ -1397,7 +1376,13 @@ export function Transactions() {
         return;
       }
 
-      setReviewRows(gridRows);
+      // Flag rows that duplicate an existing transaction or another row in
+      // this same batch (e.g. overlapping file date ranges); those default
+      // to unchecked so nothing gets imported twice without explicit review.
+      const flaggedRows = await flagDuplicateRows(gridRows);
+      const duplicateCount = flaggedRows.filter(r => r.isDuplicate).length;
+
+      setReviewRows(flaggedRows);
       setReviewPlanId(selectedPlan.import_plan_id);
       setIsImportModalOpen(false);
       setIsReviewGridOpen(true);
@@ -1406,6 +1391,11 @@ export function Transactions() {
         showWarning(
           'Some files could not be parsed',
           `Skipped: ${failedFiles.join(', ')}. Continuing with the rest.`
+        );
+      } else if (duplicateCount > 0) {
+        showWarning(
+          'Possible duplicates found',
+          `${duplicateCount} row${duplicateCount > 1 ? 's' : ''} matched an existing or repeated transaction and ${duplicateCount > 1 ? 'were' : 'was'} unchecked. Review before importing.`
         );
       }
 
@@ -1762,6 +1752,9 @@ export function Transactions() {
               <span className="text-sm">
                 {reviewRows.filter(r => r.include).length} of {reviewRows.length} selected ·{' '}
                 {reviewRows.filter(r => r.include && !r.category_id).length} uncategorized
+                {reviewRows.some(r => r.isDuplicate) && (
+                  <> · <span className="text-amber-600">{reviewRows.filter(r => r.isDuplicate).length} possible duplicate{reviewRows.filter(r => r.isDuplicate).length > 1 ? 's' : ''} unchecked</span></>
+                )}
               </span>
               <div className="flex items-center gap-2">
                 {aiEnabled && (
@@ -1815,12 +1808,22 @@ export function Transactions() {
                       }
                     };
                     return (
-                      <tr key={i} style={{ borderTop: '1px solid var(--g-color-line-generic)', opacity: row.include ? 1 : 0.45 }}>
+                      <tr
+                        key={i}
+                        style={{
+                          borderTop: '1px solid var(--g-color-line-generic)',
+                          opacity: row.include ? 1 : 0.45,
+                          background: row.isDuplicate ? 'rgba(217, 119, 6, 0.08)' : undefined,
+                        }}
+                      >
                         <td style={{ padding: '4px 8px' }}>
                           <Checkbox checked={row.include} onUpdate={(checked) => updateReviewRow(i, { include: checked })} />
                         </td>
                         <td style={{ padding: '4px 8px', whiteSpace: 'nowrap' }}>{formatDate(row.date)}</td>
-                        <td style={{ padding: '4px 8px', maxWidth: 260, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={row.comments}>
+                        <td style={{ padding: '4px 8px', maxWidth: 260, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={row.duplicateReason || row.comments}>
+                          {row.isDuplicate && (
+                            <span className="text-amber-600 font-semibold" style={{ marginRight: 6 }} title={row.duplicateReason}>⚠ Duplicate</span>
+                          )}
                           {row.comments}
                           {row.aiConfidence != null && (
                             <span className="text-xs" style={{ opacity: 0.5, marginLeft: 6 }}>({Math.round(row.aiConfidence * 100)}%)</span>
@@ -1930,39 +1933,9 @@ export function Transactions() {
                 <span>{reconcileWarningDetails?.diff.toFixed(2)}</span>
               </div>
             </div>
-            
-            {reconcileDuplicates.csvDuplicates.length > 0 && (
-              <div className="flex flex-col gap-1 border rounded-md p-3 bg-amber-50/50">
-                <span className="text-xs font-semibold text-amber-800 uppercase tracking-wider">Same-day identical transactions in CSV:</span>
-                <div className="max-h-32 overflow-y-auto flex flex-col gap-1 text-xs text-slate-700 mt-1">
-                  {reconcileDuplicates.csvDuplicates.map((item, idx) => (
-                    <div key={idx} className="flex justify-between border-b pb-1 last:border-0">
-                      <span>{item.cash} - {item.comment || item.payee_desc || 'Unknown Payee'}</span>
-                      <span className="font-semibold">{item.amount.toFixed(2)}</span>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            {reconcileDuplicates.dbMatches.length > 0 && (
-              <div className="flex flex-col gap-1 border rounded-md p-3 bg-red-50/50">
-                <span className="text-xs font-semibold text-red-800 uppercase tracking-wider">Potential duplicate matches in Database:</span>
-                <div className="max-h-32 overflow-y-auto flex flex-col gap-1 text-xs text-slate-700 mt-1">
-                  {reconcileDuplicates.dbMatches.map((match, idx) => (
-                    <div key={idx} className="flex justify-between border-b pb-1 last:border-0">
-                      <span>{match.payload.cash} - {match.payload.comment || match.dbTransaction.payee_name || 'Unknown'}</span>
-                      <span>
-                        Importing: <span className="font-semibold text-red-700">{match.payload.amount.toFixed(2)}</span> (DB: {match.dbTransaction.amount.toFixed(2)})
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
 
             <p className="text-xs text-slate-500">
-              This discrepancy could be caused by omitted duplicate same-day transactions in the CSV file, missing statement entries, or timezone issues. Please check your bank statement.
+              Possible duplicates are already flagged and unchecked in the review grid — this discrepancy is more likely a missing statement entry, an uncategorized fee, or a timezone issue. Please check your bank statement.
             </p>
           </div>
         </Dialog.Body>

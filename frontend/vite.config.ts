@@ -14,7 +14,10 @@ export default defineConfig({
     host: true,
     proxy: {
       '/api': {
-        target: 'http://localhost:8000',
+        // Defaults to the host-exposed backend port for `npm run dev` on the
+        // host; the Docker dev service overrides this to the service name
+        // (`backend`) since containers don't share localhost with the host.
+        target: process.env.VITE_DEV_API_PROXY_TARGET || 'http://localhost:8000',
         changeOrigin: true,
         secure: false,
       }
