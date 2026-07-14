@@ -180,7 +180,7 @@ export function Transactions() {
   const [isImportModalOpen, setIsImportModalOpen] = useState(false);
   const [importPlans, setImportPlans] = useState<ImportPlan[]>([]);
   const [selectedImportPlan, setSelectedImportPlan] = useState<string | undefined>(undefined);
-  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   const [importLoading, setImportLoading] = useState(false);
   const [csvTemplate, setCsvTemplate] = useState<ImportCSV | null>(null);
   const [importResults, setImportResults] = useState<{
@@ -397,7 +397,7 @@ export function Transactions() {
   const handleOpenImportModal = async () => {
     await loadImportPlans();
     setImportResults(null);
-    setSelectedFile(null);
+    setSelectedFiles([]);
     setSelectedImportPlan(undefined);
     setStartBalance('');
     setEndBalance('');
@@ -425,14 +425,25 @@ export function Transactions() {
   };
 
   const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    if (file) {
-      setSelectedFile(file);
+    const picked = Array.from(event.target.files || []);
+    if (picked.length === 0) return;
+    setSelectedFiles(prev => {
+      // Append and de-dupe by name+size so re-opening the picker doesn't drop earlier selections.
+      const existingKeys = new Set(prev.map(f => `${f.name}_${f.size}`));
+      const toAdd = picked.filter(f => !existingKeys.has(`${f.name}_${f.size}`));
+      return [...prev, ...toAdd];
+    });
+    if (fileInputRef.current) {
+      fileInputRef.current.value = '';
     }
   };
 
-  const clearSelectedFile = () => {
-    setSelectedFile(null);
+  const removeSelectedFile = (index: number) => {
+    setSelectedFiles(prev => prev.filter((_, i) => i !== index));
+  };
+
+  const clearSelectedFiles = () => {
+    setSelectedFiles([]);
     if (fileInputRef.current) {
       fileInputRef.current.value = '';
     }
@@ -1189,10 +1200,38 @@ export function Transactions() {
     showWarning('Import Cancelled', 'No transactions were saved.');
   };
 
+  // Parses one file into a plain { headers, rows } table. Non-CSV statements
+  // (Santander .xls / PDF) are normalized server-side into the same shape a
+  // plain CSV produces; .csv still parses client-side.
+  const parseFileToRows = async (file: File): Promise<{ headers: string[]; dataRows: string[][] }> => {
+    const fileName = file.name.toLowerCase();
+    const isBinaryStatement = /\.(xls|xlsx|pdf)$/.test(fileName);
+
+    if (isBinaryStatement) {
+      const formData = new FormData();
+      formData.append('file', file);
+      const parseResponse = await api.post('/accounts/parse-statement/', formData, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+      });
+      const headers = parseResponse.data.headers || [];
+      const dataRows = parseResponse.data.rows || [];
+      if (headers.length === 0 || dataRows.length === 0) {
+        throw new Error('No transactions were found in the statement file');
+      }
+      return { headers, dataRows };
+    }
+
+    const csvData = await parseCsvFile(file);
+    if (csvData.length < 2) {
+      throw new Error('CSV file must have at least a header row and one data row');
+    }
+    return { headers: csvData[0], dataRows: csvData.slice(1) };
+  };
+
   const handleImportCSV = async () => {
     if (importLoading) return;
-    if (!selectedImportPlan || !selectedFile || !csvTemplate) {
-      showWarning('Missing Information', 'Please select an import plan and a CSV file');
+    if (!selectedImportPlan || selectedFiles.length === 0 || !csvTemplate) {
+      showWarning('Missing Information', 'Please select an import plan and at least one file');
       return;
     }
 
@@ -1200,76 +1239,69 @@ export function Transactions() {
     setImportResults(null);
 
     try {
-      let headers: string[];
-      let dataRows: string[][];
-
-      const fileName = selectedFile.name.toLowerCase();
-      const isBinaryStatement = /\.(xls|xlsx|pdf)$/.test(fileName);
-
-      if (isBinaryStatement) {
-        // Non-CSV statements (Santander .xls / PDF) are normalized server-side
-        // into the same { headers, rows } shape a plain CSV produces.
-        const formData = new FormData();
-        formData.append('file', selectedFile);
-        const parseResponse = await api.post('/accounts/parse-statement/', formData, {
-          headers: { 'Content-Type': 'multipart/form-data' },
-        });
-        headers = parseResponse.data.headers || [];
-        dataRows = parseResponse.data.rows || [];
-        if (headers.length === 0 || dataRows.length === 0) {
-          throw new Error('No transactions were found in the statement file');
-        }
-      } else {
-        const csvData = await parseCsvFile(selectedFile);
-        if (csvData.length < 2) {
-          throw new Error('CSV file must have at least a header row and one data row');
-        }
-        headers = csvData[0];
-        dataRows = csvData.slice(1);
-      }
-
       const selectedPlan = importPlans.find(p => p.import_plan_id.toString() === selectedImportPlan);
       if (!selectedPlan) {
         throw new Error('Selected import plan not found');
       }
 
-      // Map rows and pre-parse
-      const parsedItems = dataRows.map((csvRow, idx) => {
-        const transaction = parseTransactionFromCsv(csvRow, headers);
-        
-        // Resolve original currency string to integer ID if present
-        if (transaction.original_currency_id) {
-          const orgCurrencyField = csvTemplate.fields.find(f => (f.map_field || f.map) === 'ORG_CURRENCY');
-          const formatType = (orgCurrencyField?.format_field || orgCurrencyField?.format || '').trim().toUpperCase();
-          
-          const valueToSearch = transaction.original_currency_id.trim().toLowerCase();
-          
-          let matched = null;
-          if (formatType === 'ISO') {
-            matched = allCurrencies.find(c => c.iso_code.toLowerCase() === valueToSearch);
-          } else if (formatType === 'SYMBOL') {
-            matched = allCurrencies.find(c => c.symbol.toLowerCase() === valueToSearch);
-          } else {
-            // Default fallback: search by ISO code first, then by symbol
-            matched = allCurrencies.find(c => c.iso_code.toLowerCase() === valueToSearch) ||
-                      allCurrencies.find(c => c.symbol.toLowerCase() === valueToSearch) ||
-                      allCurrencies.find(c => String(c.currency_id) === valueToSearch);
-          }
-          
-          if (matched) {
-            transaction.original_currency_id = String(matched.currency_id);
-          } else {
-            const isNumeric = /^\d+$/.test(transaction.original_currency_id);
-            if (!isNumeric) {
-              transaction.original_currency_id = undefined;
-            }
-          }
-        }
-        
-        return { csvRow, transaction, originalIndex: idx };
-      });
+      // Parse every selected file independently (each keeps its own headers,
+      // since header casing/order can differ file to file), then merge all
+      // rows into one combined batch before sorting/rule-matching/dedup.
+      const failedFiles: string[] = [];
+      const parsedItems: { csvRow: string[]; transaction: TransactionImport; headers: string[] }[] = [];
 
-      // Sort chronological: oldest to newest
+      for (const file of selectedFiles) {
+        try {
+          const { headers, dataRows } = await parseFileToRows(file);
+          for (const csvRow of dataRows) {
+            const transaction = parseTransactionFromCsv(csvRow, headers);
+
+            // Resolve original currency string to integer ID if present
+            if (transaction.original_currency_id) {
+              const orgCurrencyField = csvTemplate.fields.find(f => (f.map_field || f.map) === 'ORG_CURRENCY');
+              const formatType = (orgCurrencyField?.format_field || orgCurrencyField?.format || '').trim().toUpperCase();
+
+              const valueToSearch = transaction.original_currency_id.trim().toLowerCase();
+
+              let matched = null;
+              if (formatType === 'ISO') {
+                matched = allCurrencies.find(c => c.iso_code.toLowerCase() === valueToSearch);
+              } else if (formatType === 'SYMBOL') {
+                matched = allCurrencies.find(c => c.symbol.toLowerCase() === valueToSearch);
+              } else {
+                // Default fallback: search by ISO code first, then by symbol
+                matched = allCurrencies.find(c => c.iso_code.toLowerCase() === valueToSearch) ||
+                          allCurrencies.find(c => c.symbol.toLowerCase() === valueToSearch) ||
+                          allCurrencies.find(c => String(c.currency_id) === valueToSearch);
+              }
+
+              if (matched) {
+                transaction.original_currency_id = String(matched.currency_id);
+              } else {
+                const isNumeric = /^\d+$/.test(transaction.original_currency_id);
+                if (!isNumeric) {
+                  transaction.original_currency_id = undefined;
+                }
+              }
+            }
+
+            parsedItems.push({ csvRow, transaction, headers });
+          }
+        } catch (fileError) {
+          console.error(`Error parsing file ${file.name}:`, fileError);
+          failedFiles.push(file.name);
+        }
+      }
+
+      if (parsedItems.length === 0) {
+        throw new Error(
+          failedFiles.length > 0
+            ? `Could not parse any of the selected files: ${failedFiles.join(', ')}`
+            : 'No transactions were found in the selected files'
+        );
+      }
+
+      // Sort chronological: oldest to newest (across all files combined)
       const parseDateSafe = (dStr: string) => {
         const t = Date.parse(dStr);
         return isNaN(t) ? 0 : t;
@@ -1281,8 +1313,8 @@ export function Transactions() {
       for (const item of parsedItems) {
         let tx = item.transaction;
         if (!tx.date || tx.amount === 0) continue;
-        
-        const { matchedRule, isIgnored } = applyImportRules(tx, item.csvRow, headers, selectedPlan.rules);
+
+        const { matchedRule, isIgnored } = applyImportRules(tx, item.csvRow, item.headers, selectedPlan.rules);
         
         const wizardItem: any = {
           date: tx.date,
@@ -1369,6 +1401,13 @@ export function Transactions() {
       setReviewPlanId(selectedPlan.import_plan_id);
       setIsImportModalOpen(false);
       setIsReviewGridOpen(true);
+
+      if (failedFiles.length > 0) {
+        showWarning(
+          'Some files could not be parsed',
+          `Skipped: ${failedFiles.join(', ')}. Continuing with the rest.`
+        );
+      }
 
     } catch (error) {
       console.error('Error importing CSV:', error);
@@ -1653,22 +1692,35 @@ export function Transactions() {
               </div>
             </div>
             
-            <div className="flex items-center gap-2">
+            <div className="flex flex-col gap-2">
               <input
                 type="file"
                 accept=".csv,.xls,.xlsx,.pdf"
+                multiple
                 ref={fileInputRef}
                 onChange={handleFileChange}
-                style={{ display: 'none' }} 
+                style={{ display: 'none' }}
               />
-              <Button onClick={() => fileInputRef.current?.click()}>
-                <UploadIcon className="mr-2 h-4 w-4" /> Select File
-              </Button>
-              {selectedFile && (
-                <div className="flex items-center gap-2">
-                  <span className="text-sm">{selectedFile.name}</span>
-                  <Button view="flat-danger" size="s" onClick={clearSelectedFile}>Clear</Button>
-                </div>
+              <div className="flex items-center gap-2">
+                <Button onClick={() => fileInputRef.current?.click()}>
+                  <UploadIcon className="mr-2 h-4 w-4" /> Select Files
+                </Button>
+                {selectedFiles.length > 0 && (
+                  <>
+                    <span className="text-sm">{selectedFiles.length} file{selectedFiles.length > 1 ? 's' : ''} selected</span>
+                    <Button view="flat-danger" size="s" onClick={clearSelectedFiles}>Clear All</Button>
+                  </>
+                )}
+              </div>
+              {selectedFiles.length > 0 && (
+                <ul className="flex flex-col gap-1">
+                  {selectedFiles.map((file, i) => (
+                    <li key={`${file.name}_${file.size}_${i}`} className="flex items-center justify-between gap-2 text-sm">
+                      <span className="truncate">{file.name}</span>
+                      <Button view="flat-danger" size="s" onClick={() => removeSelectedFile(i)}>Remove</Button>
+                    </li>
+                  ))}
+                </ul>
               )}
             </div>
 
@@ -1698,7 +1750,7 @@ export function Transactions() {
           textButtonApply={importLoading ? 'Importing...' : 'Import'}
           onClickButtonCancel={handleCloseImportModal}
           onClickButtonApply={handleImportCSV}
-          propsButtonApply={{ disabled: !selectedImportPlan || !selectedFile || importLoading, loading: importLoading }}
+          propsButtonApply={{ disabled: !selectedImportPlan || selectedFiles.length === 0 || importLoading, loading: importLoading }}
         />
       </Dialog>
 
