@@ -102,6 +102,18 @@ export function AccountModal({ account, lookupData, onClose, onSave }: AccountMo
     }
   }, [account]);
 
+  // Default new accounts to BRL (Brazilian Real).
+  useEffect(() => {
+    const currencies = lookupData?.currencies;
+    if (!account && currencies && currencies.length > 0) {
+      setFormData(prev =>
+        prev.currency_id
+          ? prev
+          : { ...prev, currency_id: currencies.find((c: any) => c.iso_code === 'BRL')?.currency_id || prev.currency_id }
+      );
+    }
+  }, [account, lookupData]);
+
   const handleInputChange = (field: keyof Account, value: any) => {
     setFormData(prev => ({ ...prev, [field]: value }));
     // Clear error when user starts typing

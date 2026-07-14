@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useParams } from 'react-router-dom';
-import { Button, Dialog, Select, Pagination, Loader, Alert, TableColumnConfig, TextInput } from '@gravity-ui/uikit';
+import { Button, Dialog, Select, Pagination, Loader, Alert, TableColumnConfig, TextInput, Checkbox } from '@gravity-ui/uikit';
 import { Table } from '@/components/ui/gravity-table';
 import { Plus, Upload as UploadIcon } from 'lucide-react';
 
@@ -214,9 +214,16 @@ export function Transactions() {
   const [currentWizardIndex, setCurrentWizardIndex] = useState<number>(-1);
   const [isImportWizardModalOpen, setIsImportWizardModalOpen] = useState<boolean>(false);
   const [allAccounts, setAllAccounts] = useState<any[]>([]);
-  // const [allPayees, setAllPayees] = useState<any[]>([]);
+  const [allPayees, setAllPayees] = useState<any[]>([]);
   const [allCurrencies, setAllCurrencies] = useState<any[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Bulk import review grid state
+  const [isReviewGridOpen, setIsReviewGridOpen] = useState<boolean>(false);
+  const [reviewRows, setReviewRows] = useState<any[]>([]);
+  const [reviewPlanId, setReviewPlanId] = useState<number | null>(null);
+  const [aiEnabled, setAiEnabled] = useState<boolean>(false);
+  const [aiLoading, setAiLoading] = useState<boolean>(false);
 
   const fetchAccountAndTransactions = useCallback(async () => {
     if (!accountId) {
@@ -260,7 +267,7 @@ export function Transactions() {
       const response = await api.get('/transactions/lookup-data/');
       setAllCategories(response.data?.categories || []);
       setAllAccounts(response.data?.accounts || []);
-      // setAllPayees(response.data?.payees || []);
+      setAllPayees(response.data?.payees || []);
       setAllCurrencies(response.data?.currencies || []);
     } catch (error) {
       console.error('Failed to load lookup data:', error);
@@ -395,6 +402,12 @@ export function Transactions() {
     setStartBalance('');
     setEndBalance('');
     setIsImportModalOpen(true);
+    try {
+      const statusResp = await api.get('/transactions/ai-categorization/status/');
+      setAiEnabled(!!statusResp.data?.enabled);
+    } catch {
+      setAiEnabled(false);
+    }
   };
 
   const handleCloseImportModal = () => {
@@ -737,6 +750,8 @@ export function Transactions() {
       await api.post('/transactions/bulk/', payloads);
       showSuccess('CSV Import Completed Successfully!');
       setIsImportWizardModalOpen(false);
+      setIsReviewGridOpen(false);
+      setReviewRows([]);
       setIsImportModalOpen(false);
       setStartBalance('');
       setEndBalance('');
@@ -835,6 +850,8 @@ export function Transactions() {
       if (payloads.length === 0) {
         showSuccess('Import completed with no transactions saved');
         setIsImportWizardModalOpen(false);
+        setIsReviewGridOpen(false);
+        setReviewRows([]);
         setIsImportModalOpen(false);
         setStartBalance('');
         setEndBalance('');
@@ -916,6 +933,262 @@ export function Transactions() {
     showWarning('Import Cancelled', 'CSV import was aborted. No transactions were saved.');
   };
 
+  // ---- Bulk import review grid ----
+
+  const categoryFullName = (categoryId: number | null): string => {
+    if (!categoryId) return '';
+    const cat = allCategories.find(c => c.category_id === categoryId);
+    if (!cat) return '';
+    if (cat.parent_category_id) {
+      const parent = allCategories.find(c => c.category_id === cat.parent_category_id);
+      return parent ? `${parent.name}: ${cat.name}` : cat.name;
+    }
+    return cat.name;
+  };
+
+  const categoryOptions = React.useMemo(
+    () =>
+      [...allCategories]
+        .map(c => ({ value: String(c.category_id), content: categoryFullName(c.category_id) }))
+        .sort((a, b) => a.content.localeCompare(b.content)),
+    [allCategories]
+  );
+
+  const updateReviewRow = (index: number, patch: any) => {
+    setReviewRows(prev => prev.map((r, i) => (i === index ? { ...r, ...patch } : r)));
+  };
+
+  // Copy a row's category/payee to every other row with the same description.
+  const applyRowToSimilar = (index: number) => {
+    setReviewRows(prev => {
+      const src = prev[index];
+      const key = (src.comments || '').trim().toLowerCase();
+      if (!key) return prev;
+      return prev.map(r =>
+        (r.comments || '').trim().toLowerCase() === key
+          ? {
+              ...r,
+              category_id: src.category_id,
+              newCategoryName: src.newCategoryName,
+              newCategoryParent: src.newCategoryParent,
+              payee_id: src.payee_id,
+              newPayeeName: src.newPayeeName,
+            }
+          : r
+      );
+    });
+  };
+
+  const handleAiAutofill = async () => {
+    if (aiLoading) return;
+    setAiLoading(true);
+    try {
+      const payload = {
+        transactions: reviewRows.map((r, i) => ({
+          index: i,
+          description: r.comments || '',
+          amount: r.amount,
+        })),
+      };
+      const resp = await api.post('/transactions/suggest-categorization/', payload);
+      const suggestions: any[] = resp.data?.suggestions || [];
+
+      setReviewRows(prev => {
+        const next = [...prev];
+        for (const s of suggestions) {
+          const row = next[s.index];
+          if (!row) continue;
+          const updated = { ...row, aiConfidence: s.confidence ?? null };
+          // Don't overwrite values the user (or a rule) already set.
+          if (!updated.category_id && !updated.newCategoryName) {
+            if (s.category_id) {
+              updated.category_id = s.category_id;
+            } else if (s.category) {
+              updated.newCategoryName = s.category;
+              updated.newCategoryParent = s.parent || null;
+            }
+          }
+          if (!updated.payee_id && !updated.newPayeeName && s.payee) {
+            const existing = allPayees.find(
+              p => p.name.trim().toLowerCase() === String(s.payee).trim().toLowerCase()
+            );
+            if (existing) {
+              updated.payee_id = existing.payee_id;
+            } else {
+              updated.newPayeeName = s.payee;
+            }
+          }
+          next[s.index] = updated;
+        }
+        return next;
+      });
+      showSuccess('AI suggestions applied', 'Review the filled categories and payees before importing.');
+    } catch (error: any) {
+      const detail = error?.response?.data?.detail || (error instanceof Error ? error.message : 'Unknown error');
+      showError('AI auto-fill failed', detail);
+    } finally {
+      setAiLoading(false);
+    }
+  };
+
+  const resolvePayeeId = async (row: any, createdCache: { [name: string]: number }): Promise<number | null> => {
+    if (row.payee_id) return row.payee_id;
+    const name = (row.newPayeeName || '').trim();
+    if (!name) return null;
+    const key = name.toLowerCase();
+    if (createdCache[key]) return createdCache[key];
+    const existing = allPayees.find(p => p.name.trim().toLowerCase() === key);
+    if (existing) {
+      createdCache[key] = existing.payee_id;
+      return existing.payee_id;
+    }
+    const resp = await api.post('/accounts/payees/', { name });
+    const newId = resp.data?.payee_id;
+    createdCache[key] = newId;
+    return newId;
+  };
+
+  // Find or create a category by name (optionally under a parent), caching within a batch.
+  const resolveCategoryByName = async (
+    name: string,
+    parentId: number | null,
+    cache: { [key: string]: number }
+  ): Promise<number | null> => {
+    const clean = (name || '').trim();
+    if (!clean) return null;
+    const key = `${parentId || ''}|${clean.toLowerCase()}`;
+    if (cache[key]) return cache[key];
+    const existing = allCategories.find(
+      c =>
+        c.name.trim().toLowerCase() === clean.toLowerCase() &&
+        (c.parent_category_id || null) === (parentId || null)
+    );
+    if (existing) {
+      cache[key] = existing.category_id;
+      return existing.category_id;
+    }
+    const resp = await api.post('/accounts/categories/', {
+      name: clean,
+      parent_category_id: parentId,
+      is_hidden: false,
+    });
+    const newId = resp.data?.category_id;
+    cache[key] = newId;
+    return newId;
+  };
+
+  const resolveCategoryId = async (
+    row: any,
+    cache: { [key: string]: number }
+  ): Promise<number | null> => {
+    if (row.category_id) return row.category_id;
+    if (!row.newCategoryName) return null;
+    let parentId: number | null = null;
+    if (row.newCategoryParent) {
+      parentId = await resolveCategoryByName(row.newCategoryParent, null, cache);
+    }
+    return resolveCategoryByName(row.newCategoryName, parentId, cache);
+  };
+
+  const handleReviewImport = async () => {
+    if (importLoading) return;
+    const rowsToImport = reviewRows.filter(r => r.include);
+    if (rowsToImport.length === 0) {
+      showWarning('Nothing selected', 'Select at least one row to import.');
+      return;
+    }
+    setImportLoading(true);
+    try {
+      const createdPayees: { [name: string]: number } = {};
+      const createdCats: { [key: string]: number } = {};
+
+      // 1. Create any new payees/categories and build transaction payloads.
+      const items: any[] = [];
+      for (const row of rowsToImport) {
+        const payeeId = await resolvePayeeId(row, createdPayees);
+        const categoryId = await resolveCategoryId(row, createdCats);
+        const resolved: any = {
+          accountId: parseInt(accountId || '0'),
+          cash: row.date,
+          payment: row.payment_date || null,
+          amount: row.amount,
+          comment: row.comments || '',
+          reference: row.reference || '',
+          payee_id: payeeId || null,
+          category_id: categoryId || null,
+          toAccountId: row.to_account_id || null,
+          transactionType: row.to_account_id ? 'transfer' : (row.amount > 0 ? 'deposit' : 'withdrawal'),
+        };
+        if (row.to_account_id) {
+          resolved.toAccountCash = row.date;
+          resolved.toAccountPayment = row.payment_date || null;
+        }
+        items.push({ isIgnored: false, resolvedData: resolved });
+        row._resolvedPayeeId = payeeId || null;
+        row._resolvedCategoryId = categoryId || null;
+      }
+
+      // 2. Learn rules from rows the user asked to remember.
+      await createRulesFromRows(rowsToImport);
+
+      // 3. Reuse the existing commit path (balance reconciliation + dedup + save).
+      await commitImportBatch(items);
+    } catch (error: any) {
+      const detail = error?.response?.data?.detail || (error instanceof Error ? error.message : 'Unknown error');
+      showError('Import failed', detail);
+      setImportLoading(false);
+    }
+  };
+
+  const createRulesFromRows = async (rows: any[]) => {
+    if (!reviewPlanId || !csvTemplate) return;
+    // Rules match on the description column; find its template field id.
+    const descField = csvTemplate.fields.find(
+      (f: any) => (f.map_field || f.map) === 'COMMENTS'
+    ) || csvTemplate.fields.find(
+      (f: any) => (f.name || '').toLowerCase().startsWith('descri')
+    );
+    if (!descField) return;
+
+    const seenPatterns = new Set<string>();
+    const rulePayloads: any[] = [];
+    for (const row of rows) {
+      if (!row.rememberRule) continue;
+      const pattern = (row.comments || '').trim();
+      if (!pattern) continue;
+      const key = pattern.toLowerCase();
+      if (seenPatterns.has(key)) continue;
+      seenPatterns.add(key);
+      const payeeId = row._resolvedPayeeId ?? row.payee_id ?? null;
+      const categoryId = row._resolvedCategoryId ?? row.category_id ?? null;
+      if (!payeeId && !categoryId) continue; // nothing to remember
+      rulePayloads.push({
+        import_plan_id: reviewPlanId,
+        import_csv_field_id: descField.import_csv_field_id,
+        pattern,
+        order: 0,
+        ignore: false,
+        match_type: 'contains',
+        payee_id: payeeId,
+        category_id: categoryId,
+      });
+    }
+    if (rulePayloads.length > 0) {
+      try {
+        await api.post('/accounts/import-plan-rules/bulk/', rulePayloads);
+      } catch (error) {
+        console.error('Failed to save import rules:', error);
+        // Non-fatal — the import itself still succeeds.
+      }
+    }
+  };
+
+  const handleReviewCancel = () => {
+    setIsReviewGridOpen(false);
+    setReviewRows([]);
+    showWarning('Import Cancelled', 'No transactions were saved.');
+  };
+
   const handleImportCSV = async () => {
     if (importLoading) return;
     if (!selectedImportPlan || !selectedFile || !csvTemplate) {
@@ -927,14 +1200,34 @@ export function Transactions() {
     setImportResults(null);
 
     try {
-      const csvData = await parseCsvFile(selectedFile);
-      if (csvData.length < 2) {
-        throw new Error('CSV file must have at least a header row and one data row');
+      let headers: string[];
+      let dataRows: string[][];
+
+      const fileName = selectedFile.name.toLowerCase();
+      const isBinaryStatement = /\.(xls|xlsx|pdf)$/.test(fileName);
+
+      if (isBinaryStatement) {
+        // Non-CSV statements (Santander .xls / PDF) are normalized server-side
+        // into the same { headers, rows } shape a plain CSV produces.
+        const formData = new FormData();
+        formData.append('file', selectedFile);
+        const parseResponse = await api.post('/accounts/parse-statement/', formData, {
+          headers: { 'Content-Type': 'multipart/form-data' },
+        });
+        headers = parseResponse.data.headers || [];
+        dataRows = parseResponse.data.rows || [];
+        if (headers.length === 0 || dataRows.length === 0) {
+          throw new Error('No transactions were found in the statement file');
+        }
+      } else {
+        const csvData = await parseCsvFile(selectedFile);
+        if (csvData.length < 2) {
+          throw new Error('CSV file must have at least a header row and one data row');
+        }
+        headers = csvData[0];
+        dataRows = csvData.slice(1);
       }
 
-      const headers = csvData[0];
-      const dataRows = csvData.slice(1);
-      
       const selectedPlan = importPlans.find(p => p.import_plan_id.toString() === selectedImportPlan);
       if (!selectedPlan) {
         throw new Error('Selected import plan not found');
@@ -1043,17 +1336,40 @@ export function Transactions() {
         wizardItems.push(wizardItem);
       }
 
-      const firstPendingIndex = wizardItems.findIndex(item => !item.isIgnored && !item.isMatched);
-      
-      if (firstPendingIndex === -1) {
-        await commitImportBatch(wizardItems);
-      } else {
-        setIsImportModalOpen(false);
-        setImportWizardItems(wizardItems);
-        setCurrentWizardIndex(firstPendingIndex);
-        setIsImportWizardModalOpen(true);
+      // Build the bulk review grid from every non-ignored row. Rules that
+      // matched already pre-filled payee_id/category_id; the rest start blank
+      // and can be filled by hand, by "apply to similar", or by AI.
+      const gridRows = wizardItems
+        .filter(item => !item.isIgnored)
+        .map(item => ({
+          date: item.date,
+          payment_date: item.payment_date,
+          amount: item.amount,
+          comments: item.comments || '',
+          reference: item.reference || '',
+          payee_desc: item.payee_desc || '',
+          csvRow: item.csvRow,
+          category_id: item.category_id ?? null,
+          payee_id: item.payee_id ?? null,
+          to_account_id: item.to_account_id ?? null,
+          newPayeeName: null as string | null,
+          newCategoryName: null as string | null,
+          newCategoryParent: null as string | null,
+          rememberRule: false,
+          aiConfidence: null as number | null,
+          include: true,
+        }));
+
+      if (gridRows.length === 0) {
+        showWarning('Nothing to import', 'All rows were ignored by the import plan rules.');
+        return;
       }
-      
+
+      setReviewRows(gridRows);
+      setReviewPlanId(selectedPlan.import_plan_id);
+      setIsImportModalOpen(false);
+      setIsReviewGridOpen(true);
+
     } catch (error) {
       console.error('Error importing CSV:', error);
       showError('CSV Import Failed', error instanceof Error ? error.message : 'Unknown error');
@@ -1338,9 +1654,9 @@ export function Transactions() {
             </div>
             
             <div className="flex items-center gap-2">
-              <input 
-                type="file" 
-                accept=".csv" 
+              <input
+                type="file"
+                accept=".csv,.xls,.xlsx,.pdf"
                 ref={fileInputRef}
                 onChange={handleFileChange}
                 style={{ display: 'none' }} 
@@ -1383,6 +1699,150 @@ export function Transactions() {
           onClickButtonCancel={handleCloseImportModal}
           onClickButtonApply={handleImportCSV}
           propsButtonApply={{ disabled: !selectedImportPlan || !selectedFile || importLoading, loading: importLoading }}
+        />
+      </Dialog>
+
+      <Dialog open={isReviewGridOpen} onClose={handleReviewCancel}>
+        <Dialog.Header caption="Review & Import Transactions" />
+        <Dialog.Body>
+          <div style={{ width: 'min(1100px, 88vw)' }}>
+            <div className="flex items-center justify-between mb-3 gap-2 flex-wrap">
+              <span className="text-sm">
+                {reviewRows.filter(r => r.include).length} of {reviewRows.length} selected ·{' '}
+                {reviewRows.filter(r => r.include && !r.category_id).length} uncategorized
+              </span>
+              <div className="flex items-center gap-2">
+                {aiEnabled && (
+                  <Button view="outlined-action" onClick={handleAiAutofill} loading={aiLoading} disabled={aiLoading}>
+                    ✨ Auto-fill with AI
+                  </Button>
+                )}
+              </div>
+            </div>
+            <div style={{ maxHeight: '58vh', overflow: 'auto', border: '1px solid var(--g-color-line-generic)', borderRadius: 6 }}>
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+                <thead style={{ position: 'sticky', top: 0, background: 'var(--g-color-base-background)', zIndex: 1 }}>
+                  <tr className="text-left">
+                    <th style={{ padding: '6px 8px', width: 32 }}></th>
+                    <th style={{ padding: '6px 8px', width: 90 }}>Date</th>
+                    <th style={{ padding: '6px 8px' }}>Description</th>
+                    <th style={{ padding: '6px 8px', width: 100, textAlign: 'right' }}>Amount</th>
+                    <th style={{ padding: '6px 8px', width: 230 }}>Category</th>
+                    <th style={{ padding: '6px 8px', width: 230 }}>Payee</th>
+                    <th style={{ padding: '6px 8px', width: 70, textAlign: 'center' }} title="Save a rule so future imports auto-fill this description">Rule</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {reviewRows.map((row, i) => {
+                    const payeeOptions = allPayees.map(p => ({ value: String(p.payee_id), content: p.name }));
+                    let payeeValue: string[] = [];
+                    if (row.payee_id) {
+                      payeeValue = [String(row.payee_id)];
+                    } else if (row.newPayeeName) {
+                      payeeOptions.unshift({ value: `new:${row.newPayeeName}`, content: `➕ ${row.newPayeeName} (new)` });
+                      payeeValue = [`new:${row.newPayeeName}`];
+                    }
+                    const catOpts = [...categoryOptions];
+                    let catValue: string[] = [];
+                    if (row.category_id) {
+                      catValue = [String(row.category_id)];
+                    } else if (row.newCategoryName) {
+                      const label = row.newCategoryParent ? `${row.newCategoryParent}: ${row.newCategoryName}` : row.newCategoryName;
+                      catOpts.unshift({ value: `newcat:${label}`, content: `➕ ${label} (new)` });
+                      catValue = [`newcat:${label}`];
+                    }
+                    const promptNewCategory = () => {
+                      const input = window.prompt("New category — use 'Parent: Child' for a subcategory:");
+                      if (!input || !input.trim()) return;
+                      const t = input.trim();
+                      if (t.includes(':')) {
+                        const idx = t.indexOf(':');
+                        updateReviewRow(i, { category_id: null, newCategoryParent: t.slice(0, idx).trim(), newCategoryName: t.slice(idx + 1).trim() });
+                      } else {
+                        updateReviewRow(i, { category_id: null, newCategoryParent: null, newCategoryName: t });
+                      }
+                    };
+                    return (
+                      <tr key={i} style={{ borderTop: '1px solid var(--g-color-line-generic)', opacity: row.include ? 1 : 0.45 }}>
+                        <td style={{ padding: '4px 8px' }}>
+                          <Checkbox checked={row.include} onUpdate={(checked) => updateReviewRow(i, { include: checked })} />
+                        </td>
+                        <td style={{ padding: '4px 8px', whiteSpace: 'nowrap' }}>{formatDate(row.date)}</td>
+                        <td style={{ padding: '4px 8px', maxWidth: 260, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={row.comments}>
+                          {row.comments}
+                          {row.aiConfidence != null && (
+                            <span className="text-xs" style={{ opacity: 0.5, marginLeft: 6 }}>({Math.round(row.aiConfidence * 100)}%)</span>
+                          )}
+                        </td>
+                        <td style={{ padding: '4px 8px', textAlign: 'right', whiteSpace: 'nowrap' }}>
+                          <span className={row.amount < 0 ? 'text-red-500' : 'text-green-500'}>{row.amount.toFixed(2)}</span>
+                        </td>
+                        <td style={{ padding: '4px 8px' }}>
+                          <div className="flex items-center gap-1">
+                            <Select
+                              size="s"
+                              filterable
+                              width="max"
+                              placeholder="Uncategorized"
+                              hasClear
+                              value={catValue}
+                              options={catOpts}
+                              onUpdate={(vals) => {
+                                const v = vals[0];
+                                if (!v) updateReviewRow(i, { category_id: null, newCategoryName: null, newCategoryParent: null });
+                                else if (!v.startsWith('newcat:')) updateReviewRow(i, { category_id: parseInt(v, 10), newCategoryName: null, newCategoryParent: null });
+                              }}
+                            />
+                            <Button view="flat" size="s" onClick={promptNewCategory} title="Create a new category">＋</Button>
+                          </div>
+                        </td>
+                        <td style={{ padding: '4px 8px' }}>
+                          <Select
+                            size="s"
+                            filterable
+                            width="max"
+                            placeholder="—"
+                            hasClear
+                            value={payeeValue}
+                            options={payeeOptions}
+                            onUpdate={(vals) => {
+                              const v = vals[0];
+                              if (!v) updateReviewRow(i, { payee_id: null, newPayeeName: null });
+                              else if (v.startsWith('new:')) updateReviewRow(i, { payee_id: null, newPayeeName: v.slice(4) });
+                              else updateReviewRow(i, { payee_id: parseInt(v, 10), newPayeeName: null });
+                            }}
+                          />
+                        </td>
+                        <td style={{ padding: '4px 8px', textAlign: 'center' }}>
+                          <Checkbox
+                            checked={row.rememberRule}
+                            disabled={!row.category_id && !row.payee_id && !row.newPayeeName}
+                            onUpdate={(checked) => updateReviewRow(i, { rememberRule: checked })}
+                          />
+                          {i === 0 || (reviewRows[i - 1]?.comments || '').trim().toLowerCase() !== (row.comments || '').trim().toLowerCase() ? (
+                            <div>
+                              <Button view="flat" size="s" onClick={() => applyRowToSimilar(i)} title="Apply this row's category & payee to all rows with the same description">↧ similar</Button>
+                            </div>
+                          ) : null}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+            <p className="text-xs mt-2" style={{ opacity: 0.6 }}>
+              Rows left uncategorized import as-is (no category/payee) and can be edited later. Check "Rule" to remember a description → category/payee for future imports.
+            </p>
+          </div>
+        </Dialog.Body>
+        <Dialog.Footer
+          preset="default"
+          textButtonCancel="Cancel"
+          textButtonApply={importLoading ? 'Importing...' : `Import ${reviewRows.filter(r => r.include).length}`}
+          onClickButtonCancel={handleReviewCancel}
+          onClickButtonApply={handleReviewImport}
+          propsButtonApply={{ disabled: importLoading || reviewRows.filter(r => r.include).length === 0, loading: importLoading }}
         />
       </Dialog>
 

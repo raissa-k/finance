@@ -2,6 +2,7 @@ import math
 from datetime import date, datetime
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel
 from sqlalchemy.orm import Session, joinedload
 from app.database import get_db
 from app.models import (
@@ -21,6 +22,48 @@ from app.routes.transactions_helpers import (
 )
 
 router = APIRouter(prefix="/transactions", tags=["Transactions"])
+
+
+class SuggestTransaction(BaseModel):
+    index: int
+    description: str = ""
+    amount: float = 0.0
+
+
+class SuggestCategorizationRequest(BaseModel):
+    transactions: List[SuggestTransaction]
+
+
+@router.get("/ai-categorization/status/")
+def ai_categorization_status():
+    """Report whether AI-assisted categorization is available and via which provider."""
+    from app.ai_categorize import active_model, resolve_provider
+
+    provider = resolve_provider()
+    return {
+        "enabled": provider is not None,
+        "provider": provider,
+        "model": active_model(),
+    }
+
+
+@router.post("/suggest-categorization/")
+def suggest_categorization_route(
+    payload: SuggestCategorizationRequest, db: Session = Depends(get_db)
+):
+    """Suggest a category + payee for each transaction using Claude.
+
+    Returns ``{"suggestions": [{index, category_id, payee, confidence}, ...]}``.
+    The client pre-fills the import review grid with these; nothing is saved.
+    """
+    from app.ai_categorize import AICategorizationError, suggest_categorization
+
+    items = [t.model_dump() for t in payload.transactions]
+    try:
+        suggestions = suggest_categorization(db, items)
+    except AICategorizationError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    return {"suggestions": suggestions}
 
 
 @router.get("/lookup-data/")

@@ -376,5 +376,10 @@ class TransactionResponse(BaseModel):
 class SettingsConfigUpdate(BaseModel):
     currency_url: str
     currrency_api: str
+    ai_provider: str = ""
+    anthropic_api_key: str = ""
+    anthropic_model: str = ""
+    gemini_api_key: str = ""
+    gemini_model: str = ""
 
 

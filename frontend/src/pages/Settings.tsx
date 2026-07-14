@@ -4,8 +4,15 @@ import { Input } from '@/components/ui/input';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from '@/components/ui/dialog';
 import { Label } from '@/components/ui/label';
-import { Download, Database, AlertCircle, Upload, RotateCcw, Loader2, CheckCircle2, X } from 'lucide-react';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { Download, Database, AlertCircle, Upload, RotateCcw, Loader2, CheckCircle2, X, Sparkles } from 'lucide-react';
 import api from '@/services/api';
+
+const AI_PROVIDER_OPTIONS = [
+  { value: 'auto', label: 'Auto-detect (uses whichever key is set below)' },
+  { value: 'anthropic', label: 'Anthropic (Claude)' },
+  { value: 'gemini', label: 'Google Gemini' },
+];
 
 export function Settings() {
   const [isBackingUp, setIsBackingUp] = useState(false);
@@ -25,6 +32,16 @@ export function Settings() {
   const [isConfigSaving, setIsConfigSaving] = useState(false);
   const [configSuccess, setConfigSuccess] = useState<string | null>(null);
   const [configError, setConfigError] = useState<string | null>(null);
+
+  // AI Categorization Configuration states
+  const [aiProvider, setAiProvider] = useState('auto');
+  const [anthropicApiKey, setAnthropicApiKey] = useState('');
+  const [anthropicModel, setAnthropicModel] = useState('claude-haiku-4-5');
+  const [geminiApiKey, setGeminiApiKey] = useState('');
+  const [geminiModel, setGeminiModel] = useState('gemini-2.5-flash-lite');
+  const [isAiConfigSaving, setIsAiConfigSaving] = useState(false);
+  const [aiConfigSuccess, setAiConfigSuccess] = useState<string | null>(null);
+  const [aiConfigError, setAiConfigError] = useState<string | null>(null);
   const [showEmptyDbConfirmDialog, setShowEmptyDbConfirmDialog] = useState(false);
   const [showEmptyDbCompleteDialog, setShowEmptyDbCompleteDialog] = useState(false);
   const [emptyDbCompleteMessage, setEmptyDbCompleteMessage] = useState<string>('');
@@ -295,6 +312,11 @@ export function Settings() {
         const response = await api.get('/settings/config/');
         setCurrencyUrl(response.data.currency_url || '');
         setCurrencyApi(response.data.currrency_api || '');
+        setAiProvider(response.data.ai_provider || 'auto');
+        setAnthropicApiKey(response.data.anthropic_api_key || '');
+        setAnthropicModel(response.data.anthropic_model || 'claude-haiku-4-5');
+        setGeminiApiKey(response.data.gemini_api_key || '');
+        setGeminiModel(response.data.gemini_model || 'gemini-2.5-flash-lite');
       } catch (err: any) {
         console.error('Failed to fetch configuration settings', err);
         setConfigError('Failed to load API configuration settings.');
@@ -306,6 +328,19 @@ export function Settings() {
     fetchConfig();
   }, []);
 
+  // Both config forms POST to the same /settings/config/ endpoint, so every
+  // save sends the full current state — otherwise saving one section would
+  // blank out the other's values on the server.
+  const buildConfigPayload = () => ({
+    currency_url: currencyUrl,
+    currrency_api: currencyApi,
+    ai_provider: aiProvider === 'auto' ? '' : aiProvider,
+    anthropic_api_key: anthropicApiKey,
+    anthropic_model: anthropicModel,
+    gemini_api_key: geminiApiKey,
+    gemini_model: geminiModel,
+  });
+
   const handleConfigSave = async (e: React.FormEvent) => {
     e.preventDefault();
     try {
@@ -313,10 +348,7 @@ export function Settings() {
       setConfigError(null);
       setConfigSuccess(null);
 
-      await api.post('/settings/config/', {
-        currency_url: currencyUrl,
-        currrency_api: currencyApi,
-      });
+      await api.post('/settings/config/', buildConfigPayload());
 
       setConfigSuccess('API configuration updated successfully.');
       setTimeout(() => setConfigSuccess(null), 5000);
@@ -330,6 +362,30 @@ export function Settings() {
       setConfigError(errorMessage);
     } finally {
       setIsConfigSaving(false);
+    }
+  };
+
+  const handleAiConfigSave = async (e: React.FormEvent) => {
+    e.preventDefault();
+    try {
+      setIsAiConfigSaving(true);
+      setAiConfigError(null);
+      setAiConfigSuccess(null);
+
+      await api.post('/settings/config/', buildConfigPayload());
+
+      setAiConfigSuccess('AI categorization configuration updated successfully.');
+      setTimeout(() => setAiConfigSuccess(null), 5000);
+    } catch (err: any) {
+      let errorMessage = 'Failed to update AI configuration';
+      if (err.response?.data?.detail) {
+        errorMessage = err.response.data.detail;
+      } else if (err.message) {
+        errorMessage = err.message;
+      }
+      setAiConfigError(errorMessage);
+    } finally {
+      setIsAiConfigSaving(false);
     }
   };
 
@@ -569,6 +625,149 @@ export function Settings() {
                 <CheckCircle2 className="h-4 w-4 mr-2" />
               )}
               {isConfigSaving ? 'Saving...' : 'Save Configuration'}
+            </Button>
+          </form>
+        )}
+      </div>
+
+      <div className="border rounded-lg p-6 space-y-4">
+        <div className="flex items-center space-x-3">
+          <Sparkles className="h-5 w-5 text-muted-foreground" />
+          <div className="flex-1">
+            <h2 className="text-lg font-semibold">AI Categorization</h2>
+            <p className="text-sm text-muted-foreground">
+              Configure an AI provider to auto-suggest categories and payees when importing transactions.
+              Leave both keys blank to disable AI auto-fill.
+            </p>
+          </div>
+        </div>
+
+        {aiConfigError && (
+          <Alert variant="destructive">
+            <AlertCircle className="h-4 w-4" />
+            <AlertTitle>Configuration Error</AlertTitle>
+            <AlertDescription>{aiConfigError}</AlertDescription>
+          </Alert>
+        )}
+
+        {aiConfigSuccess && (
+          <Alert>
+            <CheckCircle2 className="h-4 w-4 text-green-600" />
+            <AlertTitle>Success</AlertTitle>
+            <AlertDescription>{aiConfigSuccess}</AlertDescription>
+          </Alert>
+        )}
+
+        {isConfigLoading ? (
+          <div className="flex items-center space-x-2 py-4">
+            <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
+            <span className="text-sm text-muted-foreground">Loading configuration...</span>
+          </div>
+        ) : (
+          <form onSubmit={handleAiConfigSave} className="space-y-4 pt-2">
+            <div className="space-y-1.5">
+              <Label htmlFor="ai-provider">Active Provider</Label>
+              <Select value={aiProvider} onValueChange={setAiProvider}>
+                <SelectTrigger id="ai-provider">
+                  <SelectValue placeholder="Select a provider" />
+                </SelectTrigger>
+                <SelectContent>
+                  {AI_PROVIDER_OPTIONS.map(opt => (
+                    <SelectItem key={opt.value} value={opt.value}>{opt.label}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <p className="text-xs text-muted-foreground mt-1">
+                With Auto-detect, Anthropic is used if its key is set, otherwise Gemini.
+              </p>
+            </div>
+
+            <div className="rounded-md border p-4 space-y-3">
+              <p className="text-sm font-medium">Anthropic (Claude)</p>
+              <div className="space-y-1.5">
+                <Label htmlFor="anthropic-api-key">API Key</Label>
+                <Input
+                  id="anthropic-api-key"
+                  type="password"
+                  placeholder="sk-ant-..."
+                  value={anthropicApiKey}
+                  onChange={(e) => setAnthropicApiKey(e.target.value)}
+                  autoComplete="off"
+                />
+                <p className="text-xs text-muted-foreground mt-1">
+                  Get a key at{' '}
+                  <a
+                    href="https://console.anthropic.com/settings/keys"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-primary underline hover:text-primary/80 font-medium"
+                  >
+                    console.anthropic.com
+                  </a>.
+                </p>
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="anthropic-model">Model</Label>
+                <Input
+                  id="anthropic-model"
+                  type="text"
+                  placeholder="claude-haiku-4-5"
+                  value={anthropicModel}
+                  onChange={(e) => setAnthropicModel(e.target.value)}
+                />
+                <p className="text-xs text-muted-foreground mt-1">
+                  Defaults to Haiku, the cheapest Claude model — plenty for categorization.
+                </p>
+              </div>
+            </div>
+
+            <div className="rounded-md border p-4 space-y-3">
+              <p className="text-sm font-medium">Google Gemini</p>
+              <div className="space-y-1.5">
+                <Label htmlFor="gemini-api-key">API Key</Label>
+                <Input
+                  id="gemini-api-key"
+                  type="password"
+                  placeholder="Enter your Gemini API key"
+                  value={geminiApiKey}
+                  onChange={(e) => setGeminiApiKey(e.target.value)}
+                  autoComplete="off"
+                />
+                <p className="text-xs text-muted-foreground mt-1">
+                  Get a free key at{' '}
+                  <a
+                    href="https://aistudio.google.com/apikey"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-primary underline hover:text-primary/80 font-medium"
+                  >
+                    aistudio.google.com/apikey
+                  </a>.
+                </p>
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="gemini-model">Model</Label>
+                <Input
+                  id="gemini-model"
+                  type="text"
+                  placeholder="gemini-2.5-flash-lite"
+                  value={geminiModel}
+                  onChange={(e) => setGeminiModel(e.target.value)}
+                />
+              </div>
+            </div>
+
+            <Button
+              type="submit"
+              disabled={isAiConfigSaving}
+              className="w-full sm:w-auto"
+            >
+              {isAiConfigSaving ? (
+                <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+              ) : (
+                <CheckCircle2 className="h-4 w-4 mr-2" />
+              )}
+              {isAiConfigSaving ? 'Saving...' : 'Save AI Configuration'}
             </Button>
           </form>
         )}
