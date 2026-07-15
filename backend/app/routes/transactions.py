@@ -14,6 +14,8 @@ from app.models import (
     Transaction,
     TransactionType,
 )
+from app.category_utils import resolve_canonical_category_id
+from app.payee_utils import resolve_canonical_payee_id
 from app.schemas import PaginatedResponse, TransactionCreate, TransactionResponse
 from app.routes.transactions_helpers import (
     get_tx_response_dict,
@@ -190,7 +192,10 @@ def _create_transaction_in_db(payload: TransactionCreate, db: Session) -> Transa
 
     # Resolve IDs
     tx_data["account_id"] = payload.account_id
-    tx_data["payee_id"] = payload.payee_id
+    # New transactions always resolve to the canonical payee, even if the
+    # caller (import, AI suggestion, manual entry) passed an alias's id — see
+    # app/payee_utils.py. Existing transactions are never rewritten by this.
+    tx_data["payee_id"] = resolve_canonical_payee_id(db, payload.payee_id)
     tx_data["original_currency_id"] = payload.original_currency_id
 
     # Default Type mapping
@@ -234,7 +239,11 @@ def _create_transaction_in_db(payload: TransactionCreate, db: Session) -> Transa
             db.flush()
         tx_data["category_id"] = transfer_cat.category_id
     else:
-        tx_data["category_id"] = payload.category_id or db.query(Category).first().category_id
+        # New transactions always resolve to the canonical category, even if
+        # the caller passed an alias's id — see app/category_utils.py.
+        # Existing transactions are never rewritten by this.
+        resolved_category_id = resolve_canonical_category_id(db, payload.category_id)
+        tx_data["category_id"] = resolved_category_id or db.query(Category).first().category_id
 
     # Amount polarity
     amount_val = abs(payload.amount)

@@ -1807,6 +1807,11 @@ export function Transactions() {
                         updateReviewRow(i, { category_id: null, newCategoryParent: null, newCategoryName: t });
                       }
                     };
+                    const promptNewPayee = () => {
+                      const input = window.prompt('New payee name:');
+                      if (!input || !input.trim()) return;
+                      updateReviewRow(i, { payee_id: null, newPayeeName: input.trim() });
+                    };
                     return (
                       <tr
                         key={i}
@@ -1852,21 +1857,24 @@ export function Transactions() {
                           </div>
                         </td>
                         <td style={{ padding: '4px 8px' }}>
-                          <Select
-                            size="s"
-                            filterable
-                            width="max"
-                            placeholder="—"
-                            hasClear
-                            value={payeeValue}
-                            options={payeeOptions}
-                            onUpdate={(vals) => {
-                              const v = vals[0];
-                              if (!v) updateReviewRow(i, { payee_id: null, newPayeeName: null });
-                              else if (v.startsWith('new:')) updateReviewRow(i, { payee_id: null, newPayeeName: v.slice(4) });
-                              else updateReviewRow(i, { payee_id: parseInt(v, 10), newPayeeName: null });
-                            }}
-                          />
+                          <div className="flex items-center gap-1">
+                            <Select
+                              size="s"
+                              filterable
+                              width="max"
+                              placeholder="—"
+                              hasClear
+                              value={payeeValue}
+                              options={payeeOptions}
+                              onUpdate={(vals) => {
+                                const v = vals[0];
+                                if (!v) updateReviewRow(i, { payee_id: null, newPayeeName: null });
+                                else if (v.startsWith('new:')) updateReviewRow(i, { payee_id: null, newPayeeName: v.slice(4) });
+                                else updateReviewRow(i, { payee_id: parseInt(v, 10), newPayeeName: null });
+                              }}
+                            />
+                            <Button view="flat" size="s" onClick={promptNewPayee} title="Create a new payee">＋</Button>
+                          </div>
                         </td>
                         <td style={{ padding: '4px 8px', textAlign: 'center' }}>
                           <Checkbox

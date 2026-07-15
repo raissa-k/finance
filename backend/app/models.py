@@ -200,8 +200,12 @@ class Category(Base):
         "parent_category_id", Integer, ForeignKey("category.category_id"), nullable=True
     )
     is_hidden = Column("is_hidden", Boolean, default=False, nullable=False)
+    merged_into_category_id = Column(
+        "merged_into_category_id", Integer, ForeignKey("category.category_id"), nullable=True
+    )
 
-    parent = relationship("Category", remote_side=[category_id])
+    parent = relationship("Category", remote_side=[category_id], foreign_keys=[parent_category_id])
+    merged_into = relationship("Category", remote_side=[category_id], foreign_keys=[merged_into_category_id])
 
     def __str__(self):
         return self.name
@@ -213,6 +217,15 @@ class Payee(Base):
     payee_id = Column("payee_id", Integer, primary_key=True, autoincrement=True)
     name = Column("name", String(255), nullable=False)
     comment = Column("comment", Text, nullable=True)
+    # Non-destructive merge: when set, this payee is an alias of another
+    # payee (the canonical/"official" one). The row itself is never deleted
+    # by a merge, so import rules and AI suggestions can keep matching it by
+    # name; new transactions are written against the canonical payee instead.
+    merged_into_payee_id = Column(
+        "merged_into_payee_id", Integer, ForeignKey("payee.payee_id"), nullable=True
+    )
+
+    merged_into = relationship("Payee", remote_side=[payee_id])
 
     def __str__(self):
         return self.name

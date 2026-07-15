@@ -177,6 +177,8 @@ class CategoryCreate(CategoryBase):
 class CategoryResponse(CategoryBase):
     model_config = ConfigDict(from_attributes=True)
     category_id: int
+    merged_into_category_id: Optional[int] = None
+    merged_into_category_name: Optional[str] = None
 
 
 class CategoryMerge(BaseModel):
@@ -195,6 +197,12 @@ class PayeeCreate(PayeeBase):
 class PayeeResponse(PayeeBase):
     model_config = ConfigDict(from_attributes=True)
     payee_id: int
+    merged_into_payee_id: Optional[int] = None
+    merged_into_payee_name: Optional[str] = None
+
+
+class PayeeMerge(BaseModel):
+    destination_payee_id: int
 
 
 class ImportCsvFieldBase(BaseModel):

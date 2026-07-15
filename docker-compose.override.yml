@@ -25,3 +25,6 @@ services:
       - "3000:3000"
     environment:
       VITE_DEV_API_PROXY_TARGET: http://backend:8000
+      # Bind-mounted host edits don't reliably fire inotify events inside the
+      # container, so Vite's watcher needs polling here (see vite.config.ts).
+      VITE_DEV_USE_POLLING: "true"
