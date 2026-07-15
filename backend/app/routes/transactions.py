@@ -86,7 +86,13 @@ def transaction_lookup_data(db: Session = Depends(get_db)):
 
     return {
         "payees": [
-            {"payee_id": p.payee_id, "name": p.name, "comment": p.comment} for p in payees
+            {
+                "payee_id": p.payee_id,
+                "name": p.name,
+                "comment": p.comment,
+                "merged_into_payee_id": p.merged_into_payee_id,
+            }
+            for p in payees
         ],
         "categories": [
             {
@@ -94,6 +100,7 @@ def transaction_lookup_data(db: Session = Depends(get_db)):
                 "name": c.name,
                 "parent_category_id": c.parent_category_id,
                 "is_hidden": c.is_hidden,
+                "merged_into_category_id": c.merged_into_category_id,
             }
             for c in categories
         ],

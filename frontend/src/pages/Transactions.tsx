@@ -8,15 +8,42 @@ import { TransactionModal } from '../components/Transaction/TransactionModal';
 import api from '../services/api';
 import { showWarning, showError, showSuccess } from '../utils/notifications';
 
-const dateFilterOptions = [
+const quickDateOptions = [
   { value: 'all', content: 'All Dates' },
-  { value: 'past', content: 'Past' },
-  { value: 'future', content: 'Future' },
+  { value: 'today', content: 'Today' },
   { value: 'last7', content: 'Last 7 Days' },
   { value: 'last30', content: 'Last 30 Days' },
   { value: 'this_month', content: 'This Month' },
   { value: 'this_year', content: 'This Year' },
 ];
+
+// Fills the granular From/To date fields from a quick pick; From/To stay
+// freely editable afterward for exact-date filtering.
+const isoDate = (d: Date) => d.toISOString().slice(0, 10);
+const quickDateRange = (key: string): { from: string; to: string } => {
+  const today = new Date();
+  const to = isoDate(today);
+  switch (key) {
+    case 'today':
+      return { from: to, to };
+    case 'last7': {
+      const d = new Date(today);
+      d.setDate(d.getDate() - 7);
+      return { from: isoDate(d), to };
+    }
+    case 'last30': {
+      const d = new Date(today);
+      d.setDate(d.getDate() - 30);
+      return { from: isoDate(d), to };
+    }
+    case 'this_month':
+      return { from: isoDate(new Date(today.getFullYear(), today.getMonth(), 1)), to };
+    case 'this_year':
+      return { from: isoDate(new Date(today.getFullYear(), 0, 1)), to };
+    default:
+      return { from: '', to: '' };
+  }
+};
 
 interface Transaction {
   transaction_id: number;
@@ -169,7 +196,15 @@ export function Transactions() {
   const [currentPage, setCurrentPage] = useState(1);
   const [pageSize, setPageSize] = useState(50);
   const [totalCount, setTotalCount] = useState(0);
-  const [dateFilter, setDateFilter] = useState<string | null>(null);
+  const [quickDate, setQuickDate] = useState('all');
+  const [fromDate, setFromDate] = useState('');
+  const [toDate, setToDate] = useState('');
+  const [minAmount, setMinAmount] = useState('');
+  const [maxAmount, setMaxAmount] = useState('');
+  const [commentInput, setCommentInput] = useState('');
+  const [commentFilter, setCommentFilter] = useState('');
+  const [payeeFilter, setPayeeFilter] = useState('all');
+  const [categoryFilter, setCategoryFilter] = useState('all');
   const [displayDateType, setDisplayDateType] = useState<string>(() => {
     if (accountId) {
       return getCookie(`display_date_type_account_${accountId}`) || 'cash';
@@ -237,11 +272,15 @@ export function Transactions() {
         page: currentPage.toString(),
         page_size: pageSize.toString(),
       });
-      
-      if (dateFilter) {
-        params.append('date_filter', dateFilter);
-      }
-      
+
+      if (fromDate) params.append('start_date', fromDate);
+      if (toDate) params.append('end_date', toDate);
+      if (minAmount) params.append('min_amount', minAmount);
+      if (maxAmount) params.append('max_amount', maxAmount);
+      if (commentFilter) params.append('comment', commentFilter);
+      if (payeeFilter !== 'all') params.append('payee_id', payeeFilter);
+      if (categoryFilter !== 'all') params.append('category_id', categoryFilter);
+
       const transactionsResponse = await api.get(`/accounts/${accountId}/transactions/`, { params });
       setTransactions(transactionsResponse.data.results || []);
       setTotalCount(transactionsResponse.data.count || 0);
@@ -255,8 +294,20 @@ export function Transactions() {
     } finally {
       setLoading(false);
     }
-  }, [accountId, currentPage, pageSize, dateFilter]);
-  
+  }, [accountId, currentPage, pageSize, fromDate, toDate, minAmount, maxAmount, commentFilter, payeeFilter, categoryFilter]);
+
+  // Debounce the comment search so we don't fire a request per keystroke.
+  useEffect(() => {
+    const t = setTimeout(() => setCommentFilter(commentInput.trim()), 400);
+    return () => clearTimeout(t);
+  }, [commentInput]);
+
+  // Any filter change invalidates the current page — jump back to page 1
+  // rather than showing an empty page 4 of a now much-smaller result set.
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [fromDate, toDate, minAmount, maxAmount, commentFilter, payeeFilter, categoryFilter]);
+
   const loadLookupData = async () => {
     try {
       const response = await api.get('/transactions/lookup-data/');
@@ -944,6 +995,46 @@ export function Transactions() {
     [allCategories]
   );
 
+  // Filter dropdowns only offer canonical (non-alias) payees/categories —
+  // matching them still catches transactions still tagged with an old alias
+  // id, since the backend resolves aliases server-side (see
+  // app/payee_utils.py / app/category_utils.py).
+  const filterCategoryOptions = React.useMemo(
+    () => [
+      { value: 'all', content: 'All Categories' },
+      ...[...allCategories]
+        .filter(c => !c.merged_into_category_id)
+        .map(c => ({ value: String(c.category_id), content: categoryFullName(c.category_id) }))
+        .sort((a, b) => a.content.localeCompare(b.content)),
+    ],
+    [allCategories]
+  );
+
+  const filterPayeeOptions = React.useMemo(
+    () => [
+      { value: 'all', content: 'All Payees' },
+      ...[...allPayees]
+        .filter(p => !p.merged_into_payee_id)
+        .map(p => ({ value: String(p.payee_id), content: p.name }))
+        .sort((a, b) => a.content.localeCompare(b.content)),
+    ],
+    [allPayees]
+  );
+
+  const hasActiveFilters = fromDate || toDate || minAmount || maxAmount || commentInput || payeeFilter !== 'all' || categoryFilter !== 'all';
+
+  const clearFilters = () => {
+    setQuickDate('all');
+    setFromDate('');
+    setToDate('');
+    setMinAmount('');
+    setMaxAmount('');
+    setCommentInput('');
+    setCommentFilter('');
+    setPayeeFilter('all');
+    setCategoryFilter('all');
+  };
+
   const updateReviewRow = (index: number, patch: any) => {
     setReviewRows(prev => prev.map((r, i) => (i === index ? { ...r, ...patch } : r)));
   };
@@ -1606,22 +1697,110 @@ export function Transactions() {
           </div>
         </div>
 
-        <div className="bg-muted/50 p-4 rounded-lg flex justify-between items-center">
-            <div className="flex items-center gap-2">
-                <span>Filter:</span>
-                <Select
-                  value={dateFilter ? [dateFilter] : ['all']}
-                  onUpdate={(val) => setDateFilter(val[0] === 'all' ? null : val[0])}
-                  options={dateFilterOptions}
+        <div className="bg-muted/50 p-4 rounded-lg flex flex-col gap-3">
+            <div className="flex flex-wrap items-end gap-3">
+              <div>
+                <label className="text-xs font-semibold block mb-1 text-muted-foreground">Comment</label>
+                <TextInput
+                  placeholder="Search comment…"
+                  value={commentInput}
+                  onUpdate={setCommentInput}
+                  size="m"
                 />
+              </div>
+              <div>
+                <label className="text-xs font-semibold block mb-1 text-muted-foreground">Payee</label>
+                <Select
+                  value={[payeeFilter]}
+                  onUpdate={(val) => setPayeeFilter(val[0] || 'all')}
+                  options={filterPayeeOptions}
+                  filterable
+                  width={180}
+                />
+              </div>
+              <div>
+                <label className="text-xs font-semibold block mb-1 text-muted-foreground">Category</label>
+                <Select
+                  value={[categoryFilter]}
+                  onUpdate={(val) => setCategoryFilter(val[0] || 'all')}
+                  options={filterCategoryOptions}
+                  filterable
+                  width={200}
+                />
+              </div>
+              <div className="flex gap-1 items-end">
+                <div>
+                  <label className="text-xs font-semibold block mb-1 text-muted-foreground">Min Value</label>
+                  <TextInput
+                    placeholder="0.00"
+                    value={minAmount}
+                    onUpdate={setMinAmount}
+                    size="m"
+                    style={{ width: 90 }}
+                  />
+                </div>
+                <span className="pb-2 text-muted-foreground">–</span>
+                <div>
+                  <label className="text-xs font-semibold block mb-1 text-muted-foreground">Max Value</label>
+                  <TextInput
+                    placeholder="0.00"
+                    value={maxAmount}
+                    onUpdate={setMaxAmount}
+                    size="m"
+                    style={{ width: 90 }}
+                  />
+                </div>
+              </div>
+              <div>
+                <label className="text-xs font-semibold block mb-1 text-muted-foreground">Quick Range</label>
+                <Select
+                  value={[quickDate]}
+                  onUpdate={(val) => {
+                    const key = val[0] || 'all';
+                    setQuickDate(key);
+                    const { from, to } = quickDateRange(key);
+                    setFromDate(from);
+                    setToDate(to);
+                  }}
+                  options={quickDateOptions}
+                  width={140}
+                />
+              </div>
+              <div className="flex gap-1 items-end">
+                <div>
+                  <label className="text-xs font-semibold block mb-1 text-muted-foreground">From</label>
+                  <input
+                    type="date"
+                    className="border rounded p-1.5 text-sm bg-background text-foreground"
+                    value={fromDate}
+                    onChange={(e) => { setFromDate(e.target.value); setQuickDate('all'); }}
+                  />
+                </div>
+                <span className="pb-2 text-muted-foreground">–</span>
+                <div>
+                  <label className="text-xs font-semibold block mb-1 text-muted-foreground">To</label>
+                  <input
+                    type="date"
+                    className="border rounded p-1.5 text-sm bg-background text-foreground"
+                    value={toDate}
+                    onChange={(e) => { setToDate(e.target.value); setQuickDate('all'); }}
+                  />
+                </div>
+              </div>
+              {hasActiveFilters && (
+                <Button view="flat" onClick={clearFilters}>Clear Filters</Button>
+              )}
             </div>
-            <Pagination
-                page={currentPage}
-                total={totalCount}
-                pageSize={pageSize}
-                onUpdate={(page, size) => { setCurrentPage(page); setPageSize(size); }}
-                pageSizeOptions={[25, 50, 100, 200]}
-            />
+            <div className="flex justify-between items-center">
+              <span className="text-sm text-muted-foreground">{totalCount} transaction{totalCount === 1 ? '' : 's'}</span>
+              <Pagination
+                  page={currentPage}
+                  total={totalCount}
+                  pageSize={pageSize}
+                  onUpdate={(page, size) => { setCurrentPage(page); setPageSize(size); }}
+                  pageSizeOptions={[25, 50, 100, 200]}
+              />
+            </div>
         </div>
 
         {loading ? (
