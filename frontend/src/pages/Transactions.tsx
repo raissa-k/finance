@@ -255,6 +255,16 @@ export function Transactions() {
   const [aiEnabled, setAiEnabled] = useState<boolean>(false);
   const [aiLoading, setAiLoading] = useState<boolean>(false);
 
+  // Multi-select + bulk edit (payee/category) for the transaction list.
+  // Selection is scoped to the current page/filter view — it's cleared
+  // whenever the list is refetched (page, filters, or after applying).
+  const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
+  const [bulkSetPayee, setBulkSetPayee] = useState(false);
+  const [bulkPayeeId, setBulkPayeeId] = useState<string>('');
+  const [bulkSetCategory, setBulkSetCategory] = useState(false);
+  const [bulkCategoryId, setBulkCategoryId] = useState<string>('');
+  const [bulkApplying, setBulkApplying] = useState(false);
+
   const fetchAccountAndTransactions = useCallback(async () => {
     if (!accountId) {
       setError("Account ID is missing.");
@@ -284,6 +294,7 @@ export function Transactions() {
       const transactionsResponse = await api.get(`/accounts/${accountId}/transactions/`, { params });
       setTransactions(transactionsResponse.data.results || []);
       setTotalCount(transactionsResponse.data.count || 0);
+      setSelectedIds(new Set());
 
     } catch (err: any) {
       console.error('Error fetching data:', err);
@@ -1531,7 +1542,61 @@ export function Transactions() {
       showError('Failed to delete transaction', error instanceof Error ? error.message : 'Unknown error');
     }
   };
-  
+
+  const toggleSelectRow = (id: number, checked: boolean) => {
+    setSelectedIds(prev => {
+      const next = new Set(prev);
+      if (checked) next.add(id); else next.delete(id);
+      return next;
+    });
+  };
+
+  const toggleSelectAllOnPage = (checked: boolean) => {
+    setSelectedIds(checked ? new Set(transactions.map(t => t.transaction_id)) : new Set());
+  };
+
+  const clearSelection = () => {
+    setSelectedIds(new Set());
+    setBulkSetPayee(false);
+    setBulkPayeeId('');
+    setBulkSetCategory(false);
+    setBulkCategoryId('');
+  };
+
+  const applyBulkEdit = async () => {
+    if (!bulkSetPayee && !bulkSetCategory) {
+      showError('Pick a payee and/or category to apply');
+      return;
+    }
+    if (bulkSetCategory && !bulkCategoryId) {
+      showError('Select a category to apply');
+      return;
+    }
+
+    setBulkApplying(true);
+    try {
+      const payload: any = { transaction_ids: Array.from(selectedIds) };
+      if (bulkSetPayee) {
+        payload.set_payee = true;
+        payload.payee_id = bulkPayeeId ? parseInt(bulkPayeeId, 10) : null;
+      }
+      if (bulkSetCategory) {
+        payload.set_category = true;
+        payload.category_id = parseInt(bulkCategoryId, 10);
+      }
+      const response = await api.post('/transactions/bulk-update/', payload);
+      const { updated, skipped } = response.data;
+      showSuccess(`Updated ${updated} transaction${updated === 1 ? '' : 's'}${skipped ? ` (${skipped} skipped — locked)` : ''}`);
+      clearSelection();
+      await fetchAccountAndTransactions();
+    } catch (error: any) {
+      showError('Failed to apply bulk edit', error?.response?.data?.detail || (error instanceof Error ? error.message : 'Unknown error'));
+    } finally {
+      setBulkApplying(false);
+    }
+  };
+
+
   if (loading && !account) {
     return <div className="flex justify-center items-center h-screen"><Loader size="l" /></div>;
   }
@@ -1576,7 +1641,31 @@ export function Transactions() {
     return chosenDate || record.cash || record.date;
   };
 
+  const allSelectedOnPage = transactions.length > 0 && transactions.every(t => selectedIds.has(t.transaction_id));
+  const someSelectedOnPage = transactions.some(t => selectedIds.has(t.transaction_id));
+
   const columns: TableColumnConfig<Transaction>[] = [
+    {
+      id: 'select',
+      width: '3%',
+      name: () => (
+        <div onClick={(e) => e.stopPropagation()}>
+          <Checkbox
+            checked={allSelectedOnPage}
+            indeterminate={someSelectedOnPage && !allSelectedOnPage}
+            onUpdate={(checked) => toggleSelectAllOnPage(checked)}
+          />
+        </div>
+      ),
+      template: (record) => (
+        <div onClick={(e) => e.stopPropagation()}>
+          <Checkbox
+            checked={selectedIds.has(record.transaction_id)}
+            onUpdate={(checked) => toggleSelectRow(record.transaction_id, checked)}
+          />
+        </div>
+      ),
+    },
     {
       id: 'date',
       width: '14%',
@@ -1634,7 +1723,7 @@ export function Transactions() {
     {
       id: 'original',
       name: '',
-      align: 'right',
+      align: 'end',
       width: '8%',
       template: (record) => {
         const isMultiCurrency = record.original_currency_id && record.original_currency_id !== account.currency_id;
@@ -1646,12 +1735,12 @@ export function Transactions() {
         return null;
       }
     },
-    { id: 'out', name: 'Out', align: 'right', width: '7%', template: (record) => record.amount < 0 ? <span className="text-red-500">{formatCurrency(Math.abs(record.amount), '')}</span> : null },
-    { id: 'in', name: 'In', align: 'right', width: '7%', template: (record) => record.amount > 0 ? <span className="text-green-500">{formatCurrency(record.amount, '')}</span> : null },
+    { id: 'out', name: 'Out', align: 'end', width: '7%', template: (record) => record.amount < 0 ? <span className="text-red-500">{formatCurrency(Math.abs(record.amount), '')}</span> : null },
+    { id: 'in', name: 'In', align: 'end', width: '7%', template: (record) => record.amount > 0 ? <span className="text-green-500">{formatCurrency(record.amount, '')}</span> : null },
     {
       id: 'balance',
       name: 'Balance',
-      align: 'right',
+      align: 'end',
       width: '8%',
       template: (record) => {
         const bal = record.balance ?? 0;
@@ -1802,6 +1891,41 @@ export function Transactions() {
               />
             </div>
         </div>
+
+        {selectedIds.size > 0 && (
+          <div className="bg-primary/5 dark:bg-primary/10 border border-primary/20 p-4 rounded-lg flex flex-wrap items-end gap-3">
+            <span className="text-sm font-semibold pb-2">{selectedIds.size} selected</span>
+            <div className="flex items-end gap-2">
+              <Checkbox checked={bulkSetPayee} onUpdate={setBulkSetPayee}>Set Payee</Checkbox>
+              <Select
+                disabled={!bulkSetPayee}
+                placeholder="Clear payee"
+                value={bulkPayeeId ? [bulkPayeeId] : []}
+                onUpdate={(val) => setBulkPayeeId(val[0] || '')}
+                options={filterPayeeOptions.slice(1)}
+                filterable
+                hasClear
+                width={180}
+              />
+            </div>
+            <div className="flex items-end gap-2">
+              <Checkbox checked={bulkSetCategory} onUpdate={setBulkSetCategory}>Set Category</Checkbox>
+              <Select
+                disabled={!bulkSetCategory}
+                placeholder="Select category"
+                value={bulkCategoryId ? [bulkCategoryId] : []}
+                onUpdate={(val) => setBulkCategoryId(val[0] || '')}
+                options={filterCategoryOptions.slice(1)}
+                filterable
+                width={200}
+              />
+            </div>
+            <Button view="action" loading={bulkApplying} disabled={bulkApplying} onClick={applyBulkEdit}>
+              Apply to {selectedIds.size}
+            </Button>
+            <Button view="flat" onClick={clearSelection}>Clear Selection</Button>
+          </div>
+        )}
 
         {loading ? (
           <div className="flex justify-center p-8"><Loader size="l" /></div>

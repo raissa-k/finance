@@ -11,7 +11,21 @@ type Category = {
   is_hidden: boolean;
   merged_into_category_id: number | null;
   merged_into_category_name: string | null;
+  related_count: number;
 };
+
+const RelatedBadge = ({ count }: { count: number }) => (
+  <span
+    className={`text-xs font-semibold px-2 py-0.5 rounded-full ${
+      count === 0
+        ? 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400'
+        : 'bg-muted text-muted-foreground'
+    }`}
+    title={count === 0 ? 'No related records — safe to delete' : `${count} related record(s) — delete is blocked until this reaches 0`}
+  >
+    {count}
+  </span>
+);
 
 export function Categories() {
   const [categories, setCategories] = useState<Category[]>([]);
@@ -357,34 +371,41 @@ export function Categories() {
               <th className="py-1 px-3 text-base font-bold text-black w-24">ID</th>
               <th className="py-1 px-3 text-base font-bold text-black">Name</th>
               <th className="py-1 px-3 text-base font-bold text-black w-28 text-center">Hidden</th>
+              <th className="py-1 px-3 text-base font-bold text-black w-28 text-center" title="Transactions, import rules, and aliases referencing this category — delete is blocked until this reaches 0">Related</th>
               <th className="py-1 px-3 text-base font-bold text-black w-40 text-center">Actions</th>
             </tr>
           </thead>
           <tbody>
             {loading && categories.length === 0 ? (
               <tr>
-                <td colSpan={5} className="py-8 text-center text-muted-foreground">
+                <td colSpan={6} className="py-8 text-center text-muted-foreground">
                   Loading categories...
                 </td>
               </tr>
             ) : filteredTree.length === 0 ? (
               <tr>
-                <td colSpan={5} className="py-8 text-center text-muted-foreground">
+                <td colSpan={6} className="py-8 text-center text-muted-foreground">
                   No categories found.
                 </td>
               </tr>
             ) : (
-              filteredTree.map(({ parent, subCategories }) => {
+              (() => {
+                // Running index across parent + visible sub-category rows so
+                // the zebra stripe flows continuously down the table instead
+                // of resetting for each parent's group.
+                let rowCounter = 0;
+                return filteredTree.map(({ parent, subCategories }) => {
                 const isExpanded = isParentExpanded(parent.category_id);
                 const hasSubs = subCategories.length > 0;
                 const isSelected = selectedParentId === parent.category_id;
+                const parentStripe = rowCounter++ % 2 === 1;
 
                 return (
                   <React.Fragment key={parent.category_id}>
                     {/* Parent Row */}
-                    <tr 
+                    <tr
                       className={`g-table__row border-b border-border/50 hover:bg-muted/20 transition-colors cursor-pointer ${
-                        isSelected ? 'bg-primary/5 dark:bg-primary/10' : ''
+                        isSelected ? 'bg-primary/5 dark:bg-primary/10' : parentStripe ? 'bg-muted/40' : ''
                       } ${
                         dragOverParentId === parent.category_id ? 'drag-over-row' : ''
                       }`}
@@ -428,12 +449,15 @@ export function Categories() {
                           <span className="text-muted-foreground">No</span>
                         )}
                       </td>
+                      <td className="py-1 px-3 text-center">
+                        <RelatedBadge count={parent.related_count} />
+                      </td>
                       <td className="py-1 px-3">
                         <div className="flex justify-center space-x-1 min-h-[28px]">
                           {!mergeSource && (
                             <>
-                              <Button 
-                                view="flat" 
+                              <Button
+                                view="flat"
                                 className="add-sub-btn"
                                 title="Add Sub-category" 
                                 onClick={(e) => { 
@@ -472,10 +496,11 @@ export function Categories() {
                     {/* Subcategories (Children) */}
                     {isExpanded && subCategories.map((sub) => {
                       const isAlias = !!sub.merged_into_category_id;
+                      const subStripe = rowCounter++ % 2 === 1;
                       return (
                         <tr
                           key={sub.category_id}
-                          className="g-table__row border-b border-border/30 hover:bg-muted/10 transition-colors bg-muted/5 cursor-grab active:cursor-grabbing"
+                          className={`g-table__row border-b border-border/30 hover:bg-muted/10 transition-colors ${subStripe ? 'bg-muted/25' : 'bg-muted/5'} cursor-grab active:cursor-grabbing`}
                           style={{ opacity: isAlias ? 0.7 : 1 }}
                           draggable={true}
                           onDragStart={(e) => handleDragStart(e, sub.category_id)}
@@ -509,6 +534,9 @@ export function Categories() {
                             ) : (
                               <span className="text-muted-foreground">No</span>
                             )}
+                          </td>
+                          <td className="py-1 px-3 text-center">
+                            <RelatedBadge count={sub.related_count} />
                           </td>
                           <td className="py-1 px-3">
                             <div className="flex justify-center space-x-1 items-center min-h-[28px]">
@@ -583,7 +611,8 @@ export function Categories() {
                     })}
                   </React.Fragment>
                 );
-              })
+              });
+              })()
             )}
           </tbody>
         </table>

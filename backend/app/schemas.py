@@ -179,6 +179,7 @@ class CategoryResponse(CategoryBase):
     category_id: int
     merged_into_category_id: Optional[int] = None
     merged_into_category_name: Optional[str] = None
+    related_count: int = 0
 
 
 class CategoryMerge(BaseModel):
@@ -199,6 +200,7 @@ class PayeeResponse(PayeeBase):
     payee_id: int
     merged_into_payee_id: Optional[int] = None
     merged_into_payee_name: Optional[str] = None
+    related_count: int = 0
 
 
 class PayeeMerge(BaseModel):

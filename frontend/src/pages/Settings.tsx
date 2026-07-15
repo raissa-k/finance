@@ -38,7 +38,7 @@ export function Settings() {
   const [anthropicApiKey, setAnthropicApiKey] = useState('');
   const [anthropicModel, setAnthropicModel] = useState('claude-haiku-4-5');
   const [geminiApiKey, setGeminiApiKey] = useState('');
-  const [geminiModel, setGeminiModel] = useState('gemini-2.5-flash-lite');
+  const [geminiModel, setGeminiModel] = useState('gemini-3.1-flash-lite');
   const [isAiConfigSaving, setIsAiConfigSaving] = useState(false);
   const [aiConfigSuccess, setAiConfigSuccess] = useState<string | null>(null);
   const [aiConfigError, setAiConfigError] = useState<string | null>(null);
@@ -316,7 +316,7 @@ export function Settings() {
         setAnthropicApiKey(response.data.anthropic_api_key || '');
         setAnthropicModel(response.data.anthropic_model || 'claude-haiku-4-5');
         setGeminiApiKey(response.data.gemini_api_key || '');
-        setGeminiModel(response.data.gemini_model || 'gemini-2.5-flash-lite');
+        setGeminiModel(response.data.gemini_model || 'gemini-3.1-flash-lite');
       } catch (err: any) {
         console.error('Failed to fetch configuration settings', err);
         setConfigError('Failed to load API configuration settings.');
@@ -750,7 +750,7 @@ export function Settings() {
                 <Input
                   id="gemini-model"
                   type="text"
-                  placeholder="gemini-2.5-flash-lite"
+                  placeholder="gemini-3.1-flash-lite"
                   value={geminiModel}
                   onChange={(e) => setGeminiModel(e.target.value)}
                 />

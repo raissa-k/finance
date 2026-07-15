@@ -1,5 +1,6 @@
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload
 from app.database import get_db
 from app.models import (
@@ -8,8 +9,10 @@ from app.models import (
     AccountType,
     Category,
     Currency,
+    ImportPlanRule,
     Payee,
     Titular,
+    Transaction,
 )
 from app.category_utils import resolve_canonical_category_id
 from app.payee_utils import resolve_canonical_payee_id
@@ -38,6 +41,19 @@ router = APIRouter(prefix="/accounts", tags=["Account Sub-resources"])
 
 def paginated_dict(results: list) -> dict:
     return {"count": len(results), "next": None, "previous": None, "results": results}
+
+
+def _count_by(db: Session, column) -> dict:
+    """Group-count non-null values of a FK column, e.g. Transaction.payee_id.
+
+    Used to report a "related records" total per payee/category — the
+    FK (RESTRICT, no ondelete) on Transaction/ImportPlanRule/the self-merge
+    columns is exactly what blocks a DELETE, so this tells the user when a
+    row is actually safe to delete (count reaches 0).
+    """
+    return dict(
+        db.query(column, func.count(column)).filter(column.isnot(None)).group_by(column).all()
+    )
 
 
 # Account Holders
@@ -223,20 +239,32 @@ def delete_account_group(pk: int, db: Session = Depends(get_db)):
 
 
 # Payees
-def _payee_response_dict(payee: Payee) -> dict:
+def _payee_response_dict(payee: Payee, related_count: int = 0) -> dict:
     return {
         "payee_id": payee.payee_id,
         "name": payee.name,
         "comment": payee.comment,
         "merged_into_payee_id": payee.merged_into_payee_id,
         "merged_into_payee_name": payee.merged_into.name if payee.merged_into else None,
+        "related_count": related_count,
     }
 
 
 @router.get("/payees/", response_model=PaginatedResponse[PayeeResponse])
 def list_payees(db: Session = Depends(get_db)):
     payees = db.query(Payee).options(joinedload(Payee.merged_into)).all()
-    return paginated_dict([_payee_response_dict(p) for p in payees])
+
+    tx_counts = _count_by(db, Transaction.payee_id)
+    rule_counts = _count_by(db, ImportPlanRule.payee_id)
+    alias_counts = _count_by(db, Payee.merged_into_payee_id)
+
+    return paginated_dict([
+        _payee_response_dict(
+            p,
+            tx_counts.get(p.payee_id, 0) + rule_counts.get(p.payee_id, 0) + alias_counts.get(p.payee_id, 0),
+        )
+        for p in payees
+    ])
 
 
 @router.post("/payees/", response_model=PayeeResponse, status_code=status.HTTP_201_CREATED)
@@ -393,7 +421,7 @@ def delete_account_type(pk: int, db: Session = Depends(get_db)):
 
 
 # Categories
-def _category_response_dict(cat: Category) -> dict:
+def _category_response_dict(cat: Category, related_count: int = 0) -> dict:
     return {
         "category_id": cat.category_id,
         "name": cat.name,
@@ -401,6 +429,7 @@ def _category_response_dict(cat: Category) -> dict:
         "is_hidden": cat.is_hidden,
         "merged_into_category_id": cat.merged_into_category_id,
         "merged_into_category_name": cat.merged_into.name if cat.merged_into else None,
+        "related_count": related_count,
     }
 
 
@@ -427,7 +456,25 @@ def list_categories(
         query = query.filter(Category.parent_category_id.is_(None))
 
     results = query.order_by(Category.name).all()
-    return paginated_dict([_category_response_dict(c) for c in results])
+
+    tx_counts = _count_by(db, Transaction.category_id)
+    rule_counts = _count_by(db, ImportPlanRule.category_id)
+    alias_counts = _count_by(db, Category.merged_into_category_id)
+    # A parent category also can't be deleted while it still has
+    # sub-categories pointing at it via parent_category_id (RESTRICT) — count
+    # those too, or a parent could show 0 and still 500 on delete.
+    child_counts = _count_by(db, Category.parent_category_id)
+
+    return paginated_dict([
+        _category_response_dict(
+            c,
+            tx_counts.get(c.category_id, 0)
+            + rule_counts.get(c.category_id, 0)
+            + alias_counts.get(c.category_id, 0)
+            + child_counts.get(c.category_id, 0),
+        )
+        for c in results
+    ])
 
 
 @router.post("/categories/", response_model=CategoryResponse, status_code=status.HTTP_201_CREATED)

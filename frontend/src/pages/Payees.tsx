@@ -9,6 +9,7 @@ interface Payee {
   comment?: string;
   merged_into_payee_id: number | null;
   merged_into_payee_name: string | null;
+  related_count: number;
 }
 
 const API = '/api/accounts/payees/';
@@ -263,14 +264,19 @@ export const Payees: React.FC = () => {
               <th className="py-1 px-3 text-sm font-bold w-16">ID</th>
               <th className="py-1 px-3 text-sm font-bold">Name</th>
               <th className="py-1 px-3 text-sm font-bold">Comment</th>
+              <th className="py-1 px-3 text-sm font-bold w-28 text-center" title="Transactions, import rules, and aliases referencing this payee — delete is blocked until this reaches 0">Related</th>
               <th className="py-1 px-3 text-sm font-bold w-40 text-center">Actions</th>
             </tr>
           </thead>
           <tbody>
-            {orderedPayees.map((payee) => {
+            {orderedPayees.map((payee, idx) => {
               const isAlias = !!payee.merged_into_payee_id;
               return (
-                <tr key={payee.payee_id} className="border-b border-border last:border-0" style={{ opacity: isAlias ? 0.7 : 1 }}>
+                <tr
+                  key={payee.payee_id}
+                  className={`border-b border-border last:border-0 ${idx % 2 === 1 ? 'bg-muted/40' : ''}`}
+                  style={{ opacity: isAlias ? 0.7 : 1 }}
+                >
                   <td className="py-1 px-3">
                     <div className="flex items-center space-x-2">
                       <Building2 className="h-4 w-4 text-muted-foreground" />
@@ -288,6 +294,18 @@ export const Payees: React.FC = () => {
                   </td>
                   <td className="py-1 px-3">
                     <span className="text-sm text-muted-foreground">{payee.comment || '-'}</span>
+                  </td>
+                  <td className="py-1 px-3 text-center">
+                    <span
+                      className={`text-xs font-semibold px-2 py-0.5 rounded-full ${
+                        payee.related_count === 0
+                          ? 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400'
+                          : 'bg-muted text-muted-foreground'
+                      }`}
+                      title={payee.related_count === 0 ? 'No related records — safe to delete' : `${payee.related_count} related record(s) — delete is blocked until this reaches 0`}
+                    >
+                      {payee.related_count}
+                    </span>
                   </td>
                   <td className="py-1 px-3">
                     <div className="flex justify-center items-center space-x-1 min-h-[28px]">
@@ -339,7 +357,7 @@ export const Payees: React.FC = () => {
             })}
             {orderedPayees.length === 0 && (
               <tr>
-                <td colSpan={4} className="py-6 text-center text-sm text-muted-foreground">No payees yet.</td>
+                <td colSpan={5} className="py-6 text-center text-sm text-muted-foreground">No payees yet.</td>
               </tr>
             )}
           </tbody>

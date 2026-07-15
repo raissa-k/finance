@@ -36,6 +36,17 @@ class SuggestCategorizationRequest(BaseModel):
     transactions: List[SuggestTransaction]
 
 
+class TransactionBulkUpdate(BaseModel):
+    transaction_ids: List[int]
+    # Explicit set_* flags (rather than just checking payee_id/category_id
+    # is not None) so "clear the payee" (payee_id=None) is distinguishable
+    # from "don't touch the payee" (set_payee=False).
+    set_payee: bool = False
+    payee_id: Optional[int] = None
+    set_category: bool = False
+    category_id: Optional[int] = None
+
+
 @router.get("/ai-categorization/status/")
 def ai_categorization_status():
     """Report whether AI-assisted categorization is available and via which provider."""
@@ -379,6 +390,53 @@ def create_transactions_bulk(payload: List[TransactionCreate], db: Session = Dep
     return results
 
 
+@router.post("/bulk-update/")
+def bulk_update_transactions(payload: TransactionBulkUpdate, db: Session = Depends(get_db)):
+    """Apply the same payee and/or category to many transactions at once.
+
+    Initial Balance rows are never editable (matches the single-transaction
+    edit guard). A "Split" parent's category is a fixed pseudo-category
+    representing the split itself, so category changes are skipped for it —
+    its payee can still be changed.
+    """
+    if not payload.transaction_ids:
+        raise HTTPException(status_code=400, detail="No transactions selected")
+    if not payload.set_payee and not payload.set_category:
+        raise HTTPException(status_code=400, detail="Nothing to update")
+
+    txs = (
+        db.query(Transaction)
+        .options(joinedload(Transaction.category))
+        .filter(Transaction.transaction_id.in_(payload.transaction_ids))
+        .all()
+    )
+
+    updated = 0
+    skipped = 0
+    for tx in txs:
+        if tx.category and tx.category.name == "Initial Balance":
+            skipped += 1
+            continue
+
+        touched = False
+        if payload.set_payee:
+            tx.payee_id = resolve_canonical_payee_id(db, payload.payee_id)
+            touched = True
+        if payload.set_category and not (tx.category and tx.category.name == "Split"):
+            resolved_category_id = resolve_canonical_category_id(db, payload.category_id)
+            if resolved_category_id is not None:
+                tx.category_id = resolved_category_id
+                touched = True
+
+        if touched:
+            updated += 1
+        else:
+            skipped += 1
+
+    db.commit()
+    return {"updated": updated, "skipped": skipped, "total": len(payload.transaction_ids)}
+
+
 @router.get("/{pk}/", response_model=TransactionResponse)
 def get_transaction(pk: int, db: Session = Depends(get_db)):
     tx = (
@@ -433,6 +491,43 @@ def update_transaction(
     tx.rate = payload.rate
     tx.quantity = payload.quantity
     tx.asset_id = payload.asset_id
+
+    # Payee/category/status/type, mirroring _create_transaction_in_db's
+    # resolution. These used to be read from payload only for amount-sign
+    # purposes and never written back to the row, so editing any of them
+    # silently had no effect despite the 200 response.
+    if payload.status_id:
+        tx.status_id = payload.status_id
+
+    if payload.transaction_type_string == "transfer":
+        tx.payee_id = None
+        transfer_cat = db.query(Category).filter(Category.name.ilike("Transfer")).first()
+        if not transfer_cat:
+            transfer_cat = Category(name="Transfer", is_hidden=True)
+            db.add(transfer_cat)
+            db.flush()
+        tx.category_id = transfer_cat.category_id
+    else:
+        tx.payee_id = resolve_canonical_payee_id(db, payload.payee_id)
+        resolved_category_id = resolve_canonical_category_id(db, payload.category_id)
+        tx.category_id = resolved_category_id or db.query(Category).first().category_id
+
+    if payload.transaction_type_id:
+        tx.transaction_type_id = payload.transaction_type_id
+    else:
+        type_mapping = {
+            "withdrawal": ["Withdrawal", "Out", "Debit"],
+            "deposit": ["Deposit", "In", "Credit"],
+            "transfer": ["Transfer"],
+        }
+        names = type_mapping.get(payload.transaction_type_string, [])
+        tx_type = None
+        for name in names:
+            tx_type = db.query(TransactionType).filter(TransactionType.name.ilike(name)).first()
+            if tx_type:
+                break
+        if tx_type:
+            tx.transaction_type_id = tx_type.transaction_type_id
 
     # Handle polarity
     amount_val = abs(payload.amount)

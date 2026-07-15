@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     anthropic_api_key: str = ""
     anthropic_model: str = "claude-haiku-4-5"
     gemini_api_key: str = ""
-    gemini_model: str = "gemini-2.5-flash-lite"
+    gemini_model: str = "gemini-3.1-flash-lite"
 
     model_config = SettingsConfigDict(
         env_file=os.path.join(BASE_DIR, ".env.local"),

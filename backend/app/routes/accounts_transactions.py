@@ -109,13 +109,37 @@ def get_account_transactions(
 
     if category_id:
         root_id = resolve_canonical_category_id(db, category_id)
-        alias_ids = [
+        selected = db.query(Category).filter(Category.category_id == root_id).first()
+
+        match_ids = {root_id}
+        match_ids.update(
             row[0]
             for row in db.query(Category.category_id)
             .filter(Category.merged_into_category_id == root_id)
             .all()
-        ]
-        query = query.filter(Transaction.category_id.in_([root_id, *alias_ids]))
+        )
+
+        # A top-level category has no transactions of its own in practice —
+        # everything gets tagged to one of its subcategories — so picking
+        # "Bills" must roll up every "Bills: X" subcategory (and each of
+        # their aliases) too, not just rows tagged to "Bills" directly.
+        if selected and selected.parent_category_id is None:
+            sub_ids = [
+                row[0]
+                for row in db.query(Category.category_id)
+                .filter(Category.parent_category_id == root_id)
+                .all()
+            ]
+            match_ids.update(sub_ids)
+            if sub_ids:
+                match_ids.update(
+                    row[0]
+                    for row in db.query(Category.category_id)
+                    .filter(Category.merged_into_category_id.in_(sub_ids))
+                    .all()
+                )
+
+        query = query.filter(Transaction.category_id.in_(match_ids))
 
     # Order newest first
     query = query.order_by(Transaction.cash.desc(), Transaction.entry.desc())
