@@ -126,7 +126,9 @@ def _extract_json_array(text: str) -> list:
     return json.loads(text[start : end + 1])
 
 
-def _call_anthropic(context_text: str, txns_text: str, max_tokens: int) -> str:
+def _call_anthropic(
+    context_text: str, txns_text: str, max_tokens: int, system_prompt: str = SYSTEM_PROMPT
+) -> str:
     try:
         import anthropic  # noqa: PLC0415
     except ImportError as exc:  # pragma: no cover
@@ -139,7 +141,7 @@ def _call_anthropic(context_text: str, txns_text: str, max_tokens: int) -> str:
         response = client.messages.create(
             model=settings.anthropic_model,
             max_tokens=max_tokens,
-            system=SYSTEM_PROMPT,
+            system=system_prompt,
             messages=[
                 {
                     "role": "user",
@@ -160,13 +162,13 @@ def _call_anthropic(context_text: str, txns_text: str, max_tokens: int) -> str:
     return "".join(b.text for b in response.content if b.type == "text")
 
 
-def _call_gemini(context_text: str, txns_text: str) -> str:
+def _call_gemini(context_text: str, txns_text: str, system_prompt: str = SYSTEM_PROMPT) -> str:
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
         f"{settings.gemini_model}:generateContent?key={settings.gemini_api_key}"
     )
     body = {
-        "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+        "system_instruction": {"parts": [{"text": system_prompt}]},
         "contents": [
             {"role": "user", "parts": [{"text": context_text + "\n\n" + txns_text}]}
         ],
@@ -191,6 +193,35 @@ def _call_gemini(context_text: str, txns_text: str) -> str:
         raise AICategorizationError("Unexpected Gemini response shape") from exc
 
 
+def _resolve_category_payee(item: dict, lookup: dict[str, int]) -> dict:
+    """Shared shaping for one LLM suggestion: resolve a category name to an
+    existing id when possible, else pass the proposed name(s) through as-is."""
+    category = item.get("category")
+    parent = item.get("parent")
+    category = category.strip() if isinstance(category, str) and category.strip() else None
+    parent = parent.strip() if isinstance(parent, str) and parent.strip() else None
+
+    category_id = None
+    if category:
+        full = f"{parent}: {category}" if parent else category
+        category_id = lookup.get(_fold(full)) or lookup.get(_fold(category))
+    if category_id:
+        # Matched an existing category -> client just selects it.
+        category = None
+        parent = None
+
+    payee = item.get("payee")
+    payee = payee.strip() if isinstance(payee, str) and payee.strip() else None
+
+    return {
+        "category_id": category_id,
+        "category": category,
+        "parent": parent,
+        "payee": payee,
+        "confidence": item.get("confidence"),
+    }
+
+
 def _classify_chunk(provider, lookup, chunk, context_text) -> list[dict]:
     txns_text = "Transactions to categorize:\n" + json.dumps(chunk, ensure_ascii=False)
     if provider == "anthropic":
@@ -199,38 +230,11 @@ def _classify_chunk(provider, lookup, chunk, context_text) -> list[dict]:
         raw = _call_gemini(context_text, txns_text)
 
     parsed = _extract_json_array(raw)
-    results = []
-    for item in parsed:
-        if not isinstance(item, dict) or "index" not in item:
-            continue
-        category = item.get("category")
-        parent = item.get("parent")
-        category = category.strip() if isinstance(category, str) and category.strip() else None
-        parent = parent.strip() if isinstance(parent, str) and parent.strip() else None
-
-        category_id = None
-        if category:
-            full = f"{parent}: {category}" if parent else category
-            category_id = lookup.get(_fold(full)) or lookup.get(_fold(category))
-        if category_id:
-            # Matched an existing category -> client just selects it.
-            category = None
-            parent = None
-
-        payee = item.get("payee")
-        payee = payee.strip() if isinstance(payee, str) and payee.strip() else None
-
-        results.append(
-            {
-                "index": item["index"],
-                "category_id": category_id,
-                "category": category,
-                "parent": parent,
-                "payee": payee,
-                "confidence": item.get("confidence"),
-            }
-        )
-    return results
+    return [
+        {"index": item["index"], **_resolve_category_payee(item, lookup)}
+        for item in parsed
+        if isinstance(item, dict) and "index" in item
+    ]
 
 
 def suggest_categorization(db: Session, transactions: list[dict]) -> list[dict]:
@@ -268,3 +272,202 @@ def suggest_categorization(db: Session, transactions: list[dict]) -> list[dict]:
             ) from exc
 
     return suggestions
+
+
+SYSTEM_PROMPT_OBLIGATIONS = (
+    "You categorize recurring bills/obligations for a personal finance app "
+    "(Brazilian Portuguese context). You are given the existing categories and "
+    "known payees. Each obligation is a budgeted bill (rent, utilities, a "
+    "subscription) -- not a bank transaction. For each one, choose the best "
+    "category and, if identifiable, a payee.\n"
+    "Rules:\n"
+    "- Prefer an existing category, returned exactly as shown. If none fits, "
+    "propose a concise new category name (and a parent when it is naturally a "
+    "sub-category).\n"
+    "- For payee, reuse a known payee name verbatim when it clearly matches; "
+    "otherwise return a cleaned name or null.\n"
+    "- confidence is 0.0-1.0.\n"
+    "Respond with ONLY a JSON array, one object per obligation, in the same "
+    "order, shaped exactly: "
+    '{"index": <int>, "category": <string|null>, "parent": <string|null>, '
+    '"payee": <string|null>, "confidence": <number>}. '
+    "No prose, no code fences."
+)
+
+
+def _classify_obligation_chunk(provider, lookup, chunk, context_text) -> list[dict]:
+    items_text = "Obligations to categorize:\n" + json.dumps(chunk, ensure_ascii=False)
+    if provider == "anthropic":
+        raw = _call_anthropic(
+            context_text,
+            items_text,
+            min(16000, 400 + 80 * len(chunk)),
+            system_prompt=SYSTEM_PROMPT_OBLIGATIONS,
+        )
+    else:
+        raw = _call_gemini(context_text, items_text, system_prompt=SYSTEM_PROMPT_OBLIGATIONS)
+
+    parsed = _extract_json_array(raw)
+    return [
+        {"index": item["index"], **_resolve_category_payee(item, lookup)}
+        for item in parsed
+        if isinstance(item, dict) and "index" in item
+    ]
+
+
+def suggest_obligation_categories(db: Session, obligations: list[dict]) -> list[dict]:
+    """Return ``{index, category_id, category, parent, payee, confidence}`` per obligation.
+
+    ``obligations`` items are ``{index, name, note}``. Mirrors
+    ``suggest_categorization`` exactly (same chunking/resolution), just with an
+    obligation-framed prompt instead of a bank-transaction one.
+    """
+    provider = resolve_provider()
+    if provider is None:
+        raise AICategorizationError(
+            "AI categorization is not configured (set ANTHROPIC_API_KEY or GEMINI_API_KEY)."
+        )
+    if not obligations:
+        return []
+
+    options, lookup = _category_context(db)
+    payees = _payee_names(db)
+    context_text = "Existing categories and known payees:\n" + json.dumps(
+        {"categories": options, "known_payees": payees[:400]}, ensure_ascii=False
+    )
+
+    suggestions: list[dict] = []
+    for start in range(0, len(obligations), CHUNK_SIZE):
+        chunk = obligations[start : start + CHUNK_SIZE]
+        try:
+            suggestions.extend(_classify_obligation_chunk(provider, lookup, chunk, context_text))
+        except AICategorizationError:
+            raise
+        except (ValueError, KeyError, json.JSONDecodeError) as exc:
+            logger.error("Failed to parse obligation categorization response: %s", exc)
+            raise AICategorizationError(
+                "Could not parse the categorization response."
+            ) from exc
+
+    return suggestions
+
+
+SYSTEM_PROMPT_CATEGORY_MATCH = (
+    "You match raw category labels -- often from a Brazilian Portuguese personal-finance "
+    "spreadsheet -- to the closest category in this app, for an obligation (budgeted "
+    "recurring/one-off bill) import. This is translation-aware: a label may be in "
+    "Portuguese while the matching category is named in English, or vice versa (e.g. "
+    "'Faculdade' or 'Universidade' means the same thing as an existing 'Education' or "
+    "'Educação' category; 'Aluguel' means the same as 'Rent' or 'Housing'). Judge by "
+    "MEANING, translating between languages as needed, not by surface spelling.\n"
+    "You are given the full list of existing categories. For each label:\n"
+    "- If an existing category's meaning matches it (even loosely, once translated), "
+    "return it EXACTLY as shown in the list -- do not force a weak match, but do not miss "
+    "an obvious translation either.\n"
+    "- If truly nothing existing fits, propose a concise NEW category name that captures "
+    "the label's meaning: translate it (matching the language/style most of the existing "
+    "categories are written in) rather than copying the raw label verbatim -- e.g. a label "
+    "meaning 'salary advance' becomes a new category named for that concept, not left as "
+    "the untranslated original text. Include a parent only when it is naturally a "
+    "sub-category of one of the EXISTING top-level categories.\n"
+    "Respond with ONLY a JSON array, one object per label, in the same order, shaped "
+    'exactly: {"index": <int>, "category": <string|null>, "parent": <string|null>}. '
+    "When matching an existing category, category/parent must be copied EXACTLY as they "
+    "appear in the existing categories list. When proposing a new one, category is the new "
+    "name and parent is an existing top-level category name or null. No prose, no code "
+    "fences."
+)
+
+
+def _match_category_chunk(provider, lookup, chunk, context_text) -> list[dict]:
+    items_text = "Labels to match:\n" + json.dumps(chunk, ensure_ascii=False)
+    if provider == "anthropic":
+        raw = _call_anthropic(
+            context_text,
+            items_text,
+            min(16000, 400 + 60 * len(chunk)),
+            system_prompt=SYSTEM_PROMPT_CATEGORY_MATCH,
+        )
+    else:
+        raw = _call_gemini(context_text, items_text, system_prompt=SYSTEM_PROMPT_CATEGORY_MATCH)
+
+    parsed = _extract_json_array(raw)
+    results = []
+    for item in parsed:
+        if not isinstance(item, dict) or "index" not in item:
+            continue
+        resolved = _resolve_category_payee(item, lookup)
+        results.append(
+            {
+                "index": item["index"],
+                "category_id": resolved["category_id"],
+                "category": resolved["category"],
+                "parent": resolved["parent"],
+            }
+        )
+    return results
+
+
+def suggest_category_matches(db: Session, labels: list[str]) -> list[dict]:
+    """Match raw category labels (e.g. from a spreadsheet import) to the closest
+    EXISTING category, translating between languages/spellings as needed, and
+    proposing a concise NEW (translated) category name when nothing existing
+    fits well enough.
+
+    Returns ``{index, category_id, category, parent}`` per label, in the same
+    order. ``category_id`` is set when an existing category matches; otherwise
+    it is ``None`` and ``category``/``parent`` hold a proposed new (sub)category
+    name for the caller (import) to create on apply, instead of falling back to
+    the raw, untranslated spreadsheet text.
+    """
+    provider = resolve_provider()
+    if provider is None:
+        raise AICategorizationError(
+            "AI categorization is not configured (set ANTHROPIC_API_KEY or GEMINI_API_KEY)."
+        )
+    if not labels:
+        return []
+
+    options, lookup = _category_context(db)
+    context_text = "Existing categories:\n" + json.dumps({"categories": options}, ensure_ascii=False)
+
+    items = [{"index": i, "label": label} for i, label in enumerate(labels)]
+    results: list[dict] = []
+    for start in range(0, len(items), CHUNK_SIZE):
+        chunk = items[start : start + CHUNK_SIZE]
+        try:
+            results.extend(_match_category_chunk(provider, lookup, chunk, context_text))
+        except AICategorizationError:
+            raise
+        except (ValueError, KeyError, json.JSONDecodeError) as exc:
+            logger.error("Failed to parse category-match response: %s", exc)
+            raise AICategorizationError("Could not parse the category-match response.") from exc
+
+    return results
+
+
+_GENERIC_SYSTEM_PROMPT = (
+    "You are a helpful assistant for a personal finance app. Answer concisely, "
+    "using only the information provided in the user message. No prose "
+    "preamble, no markdown headers, no code fences."
+)
+
+
+def call_llm_text(context_text: str, payload_text: str, max_tokens: int = 300) -> str:
+    """Generic short free-text completion, reusing whichever provider is configured.
+
+    Unlike ``suggest_categorization``/``suggest_obligation_categories`` (which
+    force a structured JSON-array response), this returns raw text -- used
+    where the caller wants a short natural-language answer (e.g. explaining an
+    obligation transaction-match suggestion) rather than a machine-parsed list.
+    """
+    provider = resolve_provider()
+    if provider is None:
+        raise AICategorizationError(
+            "AI is not configured (set ANTHROPIC_API_KEY or GEMINI_API_KEY)."
+        )
+    if provider == "anthropic":
+        return _call_anthropic(
+            context_text, payload_text, max_tokens, system_prompt=_GENERIC_SYSTEM_PROMPT
+        )
+    return _call_gemini(context_text, payload_text, system_prompt=_GENERIC_SYSTEM_PROMPT)

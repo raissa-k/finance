@@ -5,6 +5,9 @@ from app.routes import (
     accounts,
     accounts_extra,
     import_plans,
+    obligation_import,
+    obligation_occurrences,
+    obligations,
     settings as settings_route,
     subresources,
     transactions,
@@ -41,6 +44,9 @@ app.include_router(accounts.router, prefix="/api")
 app.include_router(transactions.router, prefix="/api")
 app.include_router(settings_route.router, prefix="/api")
 app.include_router(reports.router, prefix="/api")
+app.include_router(obligations.router, prefix="/api")
+app.include_router(obligation_occurrences.router, prefix="/api")
+app.include_router(obligation_import.router, prefix="/api")
 
 
 @app.get("/")

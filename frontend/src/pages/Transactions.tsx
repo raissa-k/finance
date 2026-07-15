@@ -7,6 +7,8 @@ import { Plus, Upload as UploadIcon } from 'lucide-react';
 import { TransactionModal } from '../components/Transaction/TransactionModal';
 import api from '../services/api';
 import { showWarning, showError, showSuccess } from '../utils/notifications';
+import { formatAmount as formatAmountShared, formatDate as formatDateShared } from '../utils/format';
+import { useDisplaySettings } from '../contexts/DisplaySettingsContext';
 
 const quickDateOptions = [
   { value: 'all', content: 'All Dates' },
@@ -184,6 +186,7 @@ const setCookie = (name: string, value: string, days = 365) => {
 };
 
 export function Transactions() {
+  const { defaultLocale } = useDisplaySettings();
   const { accountId } = useParams<{ accountId: string }>();
   const [account, setAccount] = useState<Account | null>(null);
   const [transactions, setTransactions] = useState<Transaction[]>([]);
@@ -375,12 +378,7 @@ export function Transactions() {
     if (!dateString) return '';
     const date = new Date(dateString);
     if (isNaN(date.getTime())) return dateString;
-    return date.toLocaleDateString('en-GB', {
-      timeZone: 'UTC',
-      day: '2-digit',
-      month: '2-digit',
-      year: 'numeric'
-    });
+    return formatDateShared(date, defaultLocale);
   };
 
   const formatDateWithOrdinal = (dateString?: string) => {
@@ -413,7 +411,7 @@ export function Transactions() {
   };
 
   const formatCurrency = (amount: number, symbol: string) => {
-    return `${symbol} ${amount.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+    return formatAmountShared(amount, symbol, defaultLocale);
   };
 
   const handleAddTransaction = () => {

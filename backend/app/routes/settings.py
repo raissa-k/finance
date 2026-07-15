@@ -339,6 +339,8 @@ def get_config():
         "anthropic_model": app_settings.anthropic_model,
         "gemini_api_key": app_settings.gemini_api_key,
         "gemini_model": app_settings.gemini_model,
+        "default_currency_id": app_settings.default_currency_id,
+        "default_locale": app_settings.default_locale,
     }
 
 
@@ -352,6 +354,8 @@ _CONFIG_ENV_KEYS = {
     "anthropic_model": "ANTHROPIC_MODEL",
     "gemini_api_key": "GEMINI_API_KEY",
     "gemini_model": "GEMINI_MODEL",
+    "default_currency_id": "DEFAULT_CURRENCY_ID",
+    "default_locale": "DEFAULT_LOCALE",
 }
 
 

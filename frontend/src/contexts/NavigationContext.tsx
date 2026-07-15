@@ -6,6 +6,7 @@ const initialMenuItems: MenuItem[] = [
   { id: 'home', label: 'Home', path: '/', icon: 'Home' },
   { id: 'reports', label: 'Reports', path: '/reports', icon: 'BarChart2' },
   { id: 'accounts', label: 'Accounts', path: '/accounts', icon: 'CreditCard' },
+  { id: 'obligations', label: 'Obligations', path: '/obligations', icon: 'ClipboardCheck' },
   { id: 'csv-templates', label: 'CSV Templates', path: '/csv-templates', icon: 'FileText' },
   { id: 'csv-import-plan', label: 'CSV Import Plan', path: '/import-plans', icon: 'Upload' },
   { id: 'categories', label: 'Categories', path: '/categories', icon: 'Grid3X3' },

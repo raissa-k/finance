@@ -14,6 +14,15 @@ const AI_PROVIDER_OPTIONS = [
   { value: 'gemini', label: 'Google Gemini' },
 ];
 
+const LOCALE_OPTIONS = [
+  { value: 'en-US', label: 'English (US) — 1,234.56 · MM/DD/YYYY' },
+  { value: 'en-GB', label: 'English (UK) — 1,234.56 · DD/MM/YYYY' },
+  { value: 'pt-BR', label: 'Portuguese (Brazil) — 1.234,56 · DD/MM/YYYY' },
+  { value: 'es-ES', label: 'Spanish (Spain) — 1.234,56 · DD/MM/YYYY' },
+  { value: 'fr-FR', label: 'French (France) — 1 234,56 · DD/MM/YYYY' },
+  { value: 'de-DE', label: 'German (Germany) — 1.234,56 · DD.MM.YYYY' },
+];
+
 export function Settings() {
   const [isBackingUp, setIsBackingUp] = useState(false);
   const [isRestoring, setIsRestoring] = useState(false);
@@ -32,6 +41,15 @@ export function Settings() {
   const [isConfigSaving, setIsConfigSaving] = useState(false);
   const [configSuccess, setConfigSuccess] = useState<string | null>(null);
   const [configError, setConfigError] = useState<string | null>(null);
+
+  // Display Defaults (currency + locale used for amount/date formatting
+  // wherever there's no more specific account/transaction currency)
+  const [displayCurrencies, setDisplayCurrencies] = useState<Array<{ currency_id: number; iso_code: string; symbol: string }>>([]);
+  const [defaultCurrencyId, setDefaultCurrencyId] = useState('');
+  const [defaultLocale, setDefaultLocale] = useState('en-US');
+  const [isDisplayConfigSaving, setIsDisplayConfigSaving] = useState(false);
+  const [displayConfigSuccess, setDisplayConfigSuccess] = useState<string | null>(null);
+  const [displayConfigError, setDisplayConfigError] = useState<string | null>(null);
 
   // AI Categorization Configuration states
   const [aiProvider, setAiProvider] = useState('auto');
@@ -317,6 +335,8 @@ export function Settings() {
         setAnthropicModel(response.data.anthropic_model || 'claude-haiku-4-5');
         setGeminiApiKey(response.data.gemini_api_key || '');
         setGeminiModel(response.data.gemini_model || 'gemini-3.1-flash-lite');
+        setDefaultCurrencyId(response.data.default_currency_id || '');
+        setDefaultLocale(response.data.default_locale || 'en-US');
       } catch (err: any) {
         console.error('Failed to fetch configuration settings', err);
         setConfigError('Failed to load API configuration settings.');
@@ -326,6 +346,10 @@ export function Settings() {
     };
 
     fetchConfig();
+
+    api.get('/accounts/currencies/')
+      .then((res) => setDisplayCurrencies(res.data.results || []))
+      .catch((err) => console.error('Failed to fetch currencies', err));
   }, []);
 
   // Both config forms POST to the same /settings/config/ endpoint, so every
@@ -339,6 +363,8 @@ export function Settings() {
     anthropic_model: anthropicModel,
     gemini_api_key: geminiApiKey,
     gemini_model: geminiModel,
+    default_currency_id: defaultCurrencyId,
+    default_locale: defaultLocale,
   });
 
   const handleConfigSave = async (e: React.FormEvent) => {
@@ -362,6 +388,30 @@ export function Settings() {
       setConfigError(errorMessage);
     } finally {
       setIsConfigSaving(false);
+    }
+  };
+
+  const handleDisplayConfigSave = async (e: React.FormEvent) => {
+    e.preventDefault();
+    try {
+      setIsDisplayConfigSaving(true);
+      setDisplayConfigError(null);
+      setDisplayConfigSuccess(null);
+
+      await api.post('/settings/config/', buildConfigPayload());
+
+      setDisplayConfigSuccess('Display defaults updated successfully.');
+      setTimeout(() => setDisplayConfigSuccess(null), 5000);
+    } catch (err: any) {
+      let errorMessage = 'Failed to update display defaults';
+      if (err.response?.data?.detail) {
+        errorMessage = err.response.data.detail;
+      } else if (err.message) {
+        errorMessage = err.message;
+      }
+      setDisplayConfigError(errorMessage);
+    } finally {
+      setIsDisplayConfigSaving(false);
     }
   };
 
@@ -625,6 +675,88 @@ export function Settings() {
                 <CheckCircle2 className="h-4 w-4 mr-2" />
               )}
               {isConfigSaving ? 'Saving...' : 'Save Configuration'}
+            </Button>
+          </form>
+        )}
+      </div>
+
+      <div className="border rounded-lg p-6 space-y-4">
+        <div className="flex items-center space-x-3">
+          <Database className="h-5 w-5 text-muted-foreground" />
+          <div className="flex-1">
+            <h2 className="text-lg font-semibold">Display Defaults</h2>
+            <p className="text-sm text-muted-foreground">
+              Default currency and locale used to format amounts and dates wherever there's no more specific
+              currency to show (e.g. Obligations) and to set the number/date formatting style everywhere else —
+              this never overrides an account or transaction's own currency.
+            </p>
+          </div>
+        </div>
+
+        {displayConfigError && (
+          <Alert variant="destructive">
+            <AlertCircle className="h-4 w-4" />
+            <AlertTitle>Configuration Error</AlertTitle>
+            <AlertDescription>{displayConfigError}</AlertDescription>
+          </Alert>
+        )}
+
+        {displayConfigSuccess && (
+          <Alert>
+            <CheckCircle2 className="h-4 w-4 text-green-600" />
+            <AlertTitle>Success</AlertTitle>
+            <AlertDescription>{displayConfigSuccess}</AlertDescription>
+          </Alert>
+        )}
+
+        {isConfigLoading ? (
+          <div className="flex items-center space-x-2 py-4">
+            <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
+            <span className="text-sm text-muted-foreground">Loading configuration...</span>
+          </div>
+        ) : (
+          <form onSubmit={handleDisplayConfigSave} className="space-y-4 pt-2">
+            <div className="space-y-1.5">
+              <Label htmlFor="default-currency">Default Currency</Label>
+              <Select value={defaultCurrencyId} onValueChange={setDefaultCurrencyId}>
+                <SelectTrigger id="default-currency">
+                  <SelectValue placeholder="Select a currency" />
+                </SelectTrigger>
+                <SelectContent>
+                  {displayCurrencies.map((c) => (
+                    <SelectItem key={c.currency_id} value={String(c.currency_id)}>
+                      {c.iso_code} ({c.symbol})
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+
+            <div className="space-y-1.5">
+              <Label htmlFor="default-locale">Default Locale</Label>
+              <Select value={defaultLocale} onValueChange={setDefaultLocale}>
+                <SelectTrigger id="default-locale">
+                  <SelectValue placeholder="Select a locale" />
+                </SelectTrigger>
+                <SelectContent>
+                  {LOCALE_OPTIONS.map((opt) => (
+                    <SelectItem key={opt.value} value={opt.value}>{opt.label}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+
+            <Button
+              type="submit"
+              disabled={isDisplayConfigSaving}
+              className="w-full sm:w-auto"
+            >
+              {isDisplayConfigSaving ? (
+                <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+              ) : (
+                <CheckCircle2 className="h-4 w-4 mr-2" />
+              )}
+              {isDisplayConfigSaving ? 'Saving...' : 'Save Display Defaults'}
             </Button>
           </form>
         )}
