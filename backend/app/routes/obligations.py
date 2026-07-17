@@ -5,10 +5,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session, joinedload
 
 from app.database import get_db
-from app.models import Category, Obligation, ObligationOccurrence, Payee
+from app.models import Category, Obligation, ObligationGroup, ObligationOccurrence, Payee
 from app.obligation_dedup import detect_duplicate_obligation, detect_duplicate_occurrence
 from app.obligation_helpers import (
     assignment_totals,
+    derive_period,
     generate_next_occurrence,
     obligation_dict,
     occurrence_dict,
@@ -16,6 +17,7 @@ from app.obligation_helpers import (
 from app.schemas import (
     ObligationCreate,
     ObligationMatchCategoriesRequest,
+    ObligationMatchGroupsRequest,
     ObligationOccurrenceCreate,
     ObligationOccurrenceResponse,
     ObligationResponse,
@@ -31,6 +33,7 @@ def _load_options():
     return (
         joinedload(Obligation.category),
         joinedload(Obligation.payee),
+        joinedload(Obligation.group),
         joinedload(Obligation.duplicate_of),
         joinedload(Obligation.occurrences),
     )
@@ -43,11 +46,15 @@ def _get_or_404(pk: int, db: Session) -> Obligation:
     return ob
 
 
-def _validate_refs(category_id: Optional[int], payee_id: Optional[int], db: Session) -> None:
+def _validate_refs(
+    category_id: Optional[int], payee_id: Optional[int], obligation_group_id: Optional[int], db: Session
+) -> None:
     if category_id is not None and not db.get(Category, category_id):
         raise HTTPException(status_code=400, detail="Category not found")
     if payee_id is not None and not db.get(Payee, payee_id):
         raise HTTPException(status_code=400, detail="Payee not found")
+    if obligation_group_id is not None and not db.get(ObligationGroup, obligation_group_id):
+        raise HTTPException(status_code=400, detail="Obligation group not found")
 
 
 @router.get("/", response_model=PaginatedResponse[ObligationResponse])
@@ -78,7 +85,7 @@ def list_obligations(
 
 @router.post("/", response_model=ObligationResponse, status_code=status.HTTP_201_CREATED)
 def create_obligation(payload: ObligationCreate, db: Session = Depends(get_db)):
-    _validate_refs(payload.category_id, payload.payee_id, db)
+    _validate_refs(payload.category_id, payload.payee_id, payload.obligation_group_id, db)
     if payload.is_recurring and not payload.recurrence:
         raise HTTPException(status_code=400, detail="A recurring obligation needs a recurrence cadence")
 
@@ -86,6 +93,7 @@ def create_obligation(payload: ObligationCreate, db: Session = Depends(get_db)):
         name=payload.name,
         category_id=payload.category_id,
         payee_id=payload.payee_id,
+        obligation_group_id=payload.obligation_group_id,
         is_recurring=payload.is_recurring,
         recurrence=payload.recurrence if payload.is_recurring else None,
         estimated_amount=payload.estimated_amount,
@@ -108,9 +116,11 @@ def create_obligation(payload: ObligationCreate, db: Session = Depends(get_db)):
     occurrence = ObligationOccurrence(
         obligation_id=ob.obligation_id,
         due_date=payload.first_due_date,
+        period=derive_period(payload.first_due_date),
         estimated_amount=first_amount,
         paid=payload.first_paid,
         paid_at=datetime.now(timezone.utc) if payload.first_paid else None,
+        paid_date=payload.first_due_date if payload.first_paid else None,
         source="manual",
     )
     db.add(occurrence)
@@ -129,13 +139,14 @@ def get_obligation(pk: int, db: Session = Depends(get_db)):
 @router.put("/{pk}/", response_model=ObligationResponse)
 def update_obligation(pk: int, payload: ObligationUpdate, db: Session = Depends(get_db)):
     ob = _get_or_404(pk, db)
-    _validate_refs(payload.category_id, payload.payee_id, db)
+    _validate_refs(payload.category_id, payload.payee_id, payload.obligation_group_id, db)
     if payload.is_recurring and not payload.recurrence:
         raise HTTPException(status_code=400, detail="A recurring obligation needs a recurrence cadence")
 
     ob.name = payload.name
     ob.category_id = payload.category_id
     ob.payee_id = payload.payee_id
+    ob.obligation_group_id = payload.obligation_group_id
     ob.is_recurring = payload.is_recurring
     ob.recurrence = payload.recurrence if payload.is_recurring else None
     ob.estimated_amount = payload.estimated_amount
@@ -189,6 +200,7 @@ def add_occurrence(pk: int, payload: ObligationOccurrenceCreate, db: Session = D
     occurrence = ObligationOccurrence(
         obligation_id=ob.obligation_id,
         due_date=payload.due_date,
+        period=derive_period(payload.due_date, payload.period),
         estimated_amount=(
             payload.estimated_amount if payload.estimated_amount is not None else ob.estimated_amount
         ),
@@ -249,6 +261,20 @@ def match_categories(payload: ObligationMatchCategoriesRequest, db: Session = De
 
     try:
         matches = suggest_category_matches(db, payload.labels)
+    except AICategorizationError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    return {"matches": matches}
+
+
+@router.post("/ai/match-groups/")
+def match_groups(payload: ObligationMatchGroupsRequest, db: Session = Depends(get_db)):
+    """Match raw obligation names (e.g. from a spreadsheet import) to an
+    EXISTING ObligationGroup -- see app.ai_categorize.suggest_group_matches.
+    Never proposes creating a new group; groups are created manually only."""
+    from app.ai_categorize import AICategorizationError, suggest_group_matches
+
+    try:
+        matches = suggest_group_matches(db, payload.labels)
     except AICategorizationError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     return {"matches": matches}

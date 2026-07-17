@@ -441,7 +441,7 @@ class ObligationImportFormatField(Base):
         ForeignKey("obligation_import_format.obligation_import_format_id", ondelete="CASCADE"),
         nullable=False,
     )
-    # name | amount | due_date | category | payee | recurrence | is_recurring | paid | direction | note
+    # name | amount | due_date | period | category | payee | recurrence | is_recurring | paid | direction | note
     target_field = Column("target_field", String(30), nullable=False)
     source_column = Column("source_column", String(255), nullable=True)
 
@@ -449,6 +449,45 @@ class ObligationImportFormatField(Base):
 
     def __str__(self):
         return f"{self.target_field} <- {self.source_column}"
+
+
+class ObligationGroup(Base):
+    """A reusable recurring-bill template ("Aluguel", Housing:Rent, payable,
+    monthly, due the 15th) that separate Obligation rows can link to.
+
+    Exists because re-importing the same recurring bill months apart (e.g.
+    next year's spreadsheet) creates a NEW Obligation each time (one per
+    import batch) rather than merging into the original -- a group lets those
+    separate Obligations share one canonical name/category/direction/cadence
+    without forcing them into a single Obligation/Occurrence tree. Editing a
+    group does NOT cascade to already-linked Obligations (they keep whatever
+    they had, possibly hand-customized) -- see the explicit `/sync/` endpoint
+    for pushing the group's current settings down on demand.
+    """
+
+    __tablename__ = "obligation_group"
+
+    obligation_group_id = Column("obligation_group_id", Integer, primary_key=True, autoincrement=True)
+    name = Column("name", String(255), nullable=False, index=True)
+    category_id = Column("category_id", Integer, ForeignKey("category.category_id"), nullable=True)
+    direction = Column("direction", String(10), default="payable", nullable=False)
+    recurrence = Column("recurrence", String(10), nullable=True)  # weekly | monthly | yearly
+    # Informational expected-payment-date, one or the other depending on
+    # recurrence -- not currently used to compute occurrence due dates.
+    expected_day_of_month = Column("expected_day_of_month", Integer, nullable=True)  # 1-31
+    expected_weekday = Column("expected_weekday", String(10), nullable=True)  # monday..sunday
+    created_at = Column(
+        "created_at",
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    category = relationship("Category")
+    obligations = relationship("Obligation", back_populates="group")
+
+    def __str__(self):
+        return self.name
 
 
 class Obligation(Base):
@@ -466,6 +505,9 @@ class Obligation(Base):
     name = Column("name", String(255), nullable=False, index=True)
     category_id = Column("category_id", Integer, ForeignKey("category.category_id"), nullable=True)
     payee_id = Column("payee_id", Integer, ForeignKey("payee.payee_id"), nullable=True)
+    obligation_group_id = Column(
+        "obligation_group_id", Integer, ForeignKey("obligation_group.obligation_group_id"), nullable=True
+    )
     is_recurring = Column("is_recurring", Boolean, default=False, nullable=False)
     recurrence = Column("recurrence", String(10), nullable=True)  # weekly | monthly | yearly
     estimated_amount = Column("estimated_amount", Float, nullable=True)
@@ -496,6 +538,7 @@ class Obligation(Base):
 
     category = relationship("Category")
     payee = relationship("Payee")
+    group = relationship("ObligationGroup", back_populates="obligations")
     duplicate_of = relationship("Obligation", remote_side=[obligation_id])
     created_via_format = relationship("ObligationImportFormat")
     occurrences = relationship(
@@ -524,6 +567,9 @@ class ObligationOccurrence(Base):
         "obligation_id", Integer, ForeignKey("obligation.obligation_id"), nullable=False, index=True
     )
     due_date = Column("due_date", Date, nullable=True, index=True)
+    # "YYYY-MM" bucket, independent of due_date (can exist even when the exact
+    # day isn't known yet) -- defaults to due_date's month when left unset.
+    period = Column("period", String(7), nullable=True, index=True)
     # Falls back to obligation.estimated_amount when null.
     estimated_amount = Column("estimated_amount", Float, nullable=True)
     # Fully independent manual toggle: assigning/unassigning transactions never

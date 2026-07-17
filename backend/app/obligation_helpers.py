@@ -13,8 +13,23 @@ from typing import Optional
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from app.models import Obligation, ObligationOccurrence, ObligationOccurrenceTransaction, Transaction
+from app.models import (
+    Obligation,
+    ObligationGroup,
+    ObligationOccurrence,
+    ObligationOccurrenceTransaction,
+    Transaction,
+)
 from app.obligation_dedup import detect_duplicate_occurrence
+
+
+def derive_period(due_date: Optional[date], explicit: Optional[str] = None) -> Optional[str]:
+    """"YYYY-MM" bucket for an occurrence: the explicit value if given, else
+    derived from due_date, else None (an occurrence can have neither, e.g. a
+    one-off with no date yet)."""
+    if explicit:
+        return explicit
+    return due_date.strftime("%Y-%m") if due_date else None
 
 
 def assignment_totals(db: Session, occurrence_ids: list[int]) -> dict[int, tuple[float, int]]:
@@ -43,6 +58,7 @@ def occurrence_dict(o: ObligationOccurrence, totals: Optional[dict[int, tuple[fl
         "obligation_id": o.obligation_id,
         "obligation_name": obligation.name if obligation else "",
         "due_date": o.due_date,
+        "period": derive_period(o.due_date, o.period),
         "estimated_amount": (
             o.estimated_amount if o.estimated_amount is not None
             else (obligation.estimated_amount if obligation else None)
@@ -81,6 +97,8 @@ def obligation_dict(
         "category_name": ob.category.name if ob.category else None,
         "payee_id": ob.payee_id,
         "payee_name": ob.payee.name if ob.payee else None,
+        "obligation_group_id": ob.obligation_group_id,
+        "obligation_group_name": ob.group.name if ob.group else None,
         "is_recurring": ob.is_recurring,
         "recurrence": ob.recurrence,
         "estimated_amount": ob.estimated_amount,
@@ -101,6 +119,21 @@ def obligation_dict(
     if include_occurrences:
         result["occurrences"] = [occurrence_dict(o, occurrence_totals) for o in occurrences]
     return result
+
+
+def group_dict(g: ObligationGroup, obligation_count: int = 0) -> dict:
+    return {
+        "obligation_group_id": g.obligation_group_id,
+        "name": g.name,
+        "category_id": g.category_id,
+        "category_name": g.category.name if g.category else None,
+        "direction": g.direction,
+        "recurrence": g.recurrence,
+        "expected_day_of_month": g.expected_day_of_month,
+        "expected_weekday": g.expected_weekday,
+        "created_at": g.created_at,
+        "obligation_count": obligation_count,
+    }
 
 
 def advance_due_date(current: date, recurrence: str) -> date:
@@ -155,6 +188,7 @@ def generate_next_occurrence(
     nxt = ObligationOccurrence(
         obligation_id=obligation.obligation_id,
         due_date=next_due,
+        period=derive_period(next_due),
         estimated_amount=occurrence.estimated_amount,
         paid=False,
         note=occurrence.note,

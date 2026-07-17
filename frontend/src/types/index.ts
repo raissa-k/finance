@@ -79,6 +79,7 @@ export interface ObligationOccurrence {
   obligation_id: number;
   obligation_name: string;
   due_date: string | null;
+  period: string | null;
   estimated_amount: number | null;
   paid: boolean;
   paid_at: string | null;
@@ -105,6 +106,8 @@ export interface Obligation {
   category_name: string | null;
   payee_id: number | null;
   payee_name: string | null;
+  obligation_group_id: number | null;
+  obligation_group_name: string | null;
   is_recurring: boolean;
   recurrence: string | null;
   estimated_amount: number | null;
@@ -121,6 +124,19 @@ export interface Obligation {
   open_occurrence_count: number;
   next_due_date: string | null;
   occurrences?: ObligationOccurrence[];
+}
+
+export interface ObligationGroup {
+  obligation_group_id: number;
+  name: string;
+  category_id: number | null;
+  category_name: string | null;
+  direction: ObligationDirection;
+  recurrence: string | null;
+  expected_day_of_month: number | null;
+  expected_weekday: string | null;
+  created_at: string;
+  obligation_count: number;
 }
 
 export interface ObligationImportFormatField {

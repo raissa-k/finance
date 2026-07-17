@@ -1,8 +1,8 @@
 import { useEffect, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { Button, TextInput, Select } from '@gravity-ui/uikit';
-import { ArrowLeft, Upload, Sparkles } from 'lucide-react';
-import { showError, showSuccess } from '@/utils/notifications';
+import { ArrowLeft, Upload, Sparkles, Trash2 } from 'lucide-react';
+import { showError, showSuccess, showConfirmDelete } from '@/utils/notifications';
 import type { ObligationImportFormat } from '@/types';
 
 const IMPORT_API = '/api/obligation-import/';
@@ -11,6 +11,7 @@ const TARGET_FIELD_LABELS: Record<string, string> = {
   name: 'Name (required)',
   amount: 'Amount (required)',
   due_date: 'Due Date',
+  period: 'Month/Year',
   category: 'Category',
   payee: 'Payee',
   recurrence: 'Recurrence',
@@ -41,6 +42,7 @@ function guessSourceColumn(target: string, headers: string[]): string {
     name: ['name', 'description', 'bill', 'obligation'],
     amount: ['amount', 'value', 'estimate', 'valor'],
     due_date: ['duedate', 'date', 'due', 'vencimento', 'data'],
+    period: ['mes', 'month', 'ano', 'year', 'periodo'],
     category: ['category', 'categoria'],
     payee: ['payee', 'vendor', 'beneficiario'],
     recurrence: ['recurrence', 'frequency', 'cadence', 'frequencia'],
@@ -90,6 +92,15 @@ export function ImportObligations() {
   const [aiSuggestingCategories, setAiSuggestingCategories] = useState(false);
   const [categoryNames, setCategoryNames] = useState<Record<number, string>>({});
 
+  // Raw obligation NAME -> obligation_group_id, filled in by AI group
+  // matching for names that didn't exactly match an existing group (an exact
+  // match is already resolved server-side at preview time). Lets a bill
+  // re-imported months apart (spelled slightly differently) attach to the
+  // same recurring-bill group instead of staying unlinked.
+  const [groupResolutions, setGroupResolutions] = useState<Record<string, number>>({});
+  const [aiSuggestingGroups, setAiSuggestingGroups] = useState(false);
+  const [groupNames, setGroupNames] = useState<Record<number, string>>({});
+
   useEffect(() => {
     fetch(`${IMPORT_API}formats/`)
       .then((res) => res.json())
@@ -108,6 +119,15 @@ export function ImportObligations() {
     fetch('/api/transactions/ai-categorization/status/')
       .then((res) => res.json())
       .then((data) => setAiEnabled(!!data?.enabled))
+      .catch(() => undefined);
+
+    fetch('/api/obligation-groups/')
+      .then((res) => res.json())
+      .then((data) => {
+        const names: Record<number, string> = {};
+        (data.results || []).forEach((g: any) => { names[g.obligation_group_id] = g.name; });
+        setGroupNames(names);
+      })
       .catch(() => undefined);
   }, []);
 
@@ -199,6 +219,7 @@ export function ImportObligations() {
     }
     setPreviewData(data);
     setCategoryResolutions({});
+    setGroupResolutions({});
     setStep('preview');
     return data;
   };
@@ -220,6 +241,9 @@ export function ImportObligations() {
       const data = await runPreview();
       if (data?.unmatched_categories?.length > 0) {
         await handleAiSuggestCategories(data.unmatched_categories);
+      }
+      if (data?.unmatched_group_names?.length > 0) {
+        await handleAiSuggestGroups(data.unmatched_group_names);
       }
     } catch (error) {
       showError('Preview failed', error instanceof Error ? error.message : 'Unknown error');
@@ -275,16 +299,63 @@ export function ImportObligations() {
     }
   };
 
+  const handleAiSuggestGroups = async (unmatchedOverride?: string[]) => {
+    const unmatched: string[] = unmatchedOverride ?? previewData?.unmatched_group_names ?? [];
+    if (unmatched.length === 0) return;
+    setAiSuggestingGroups(true);
+    try {
+      const res = await fetch('/api/obligations/ai/match-groups/', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ labels: unmatched }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        showError('AI suggestion failed', data.detail || 'AI categorization is not configured');
+        return;
+      }
+
+      const resolved: Record<string, number> = {};
+      (data.matches || []).forEach((m: any) => {
+        const label = unmatched[m.index];
+        if (label && m.obligation_group_id) resolved[label] = m.obligation_group_id;
+      });
+
+      if (Object.keys(resolved).length === 0) {
+        showSuccess('AI found no matching groups for the unmatched bill names');
+        return;
+      }
+
+      setGroupResolutions((prev) => ({ ...prev, ...resolved }));
+      setPreviewData((prev: any) => ({
+        ...prev,
+        unmatched_group_names: prev.unmatched_group_names.filter((n: string) => !(n in resolved)),
+      }));
+      const n = Object.keys(resolved).length;
+      showSuccess(`AI matched ${n} bill${n === 1 ? '' : 's'} to existing group${n === 1 ? '' : 's'}`);
+    } catch (error) {
+      showError('AI suggestion failed', error instanceof Error ? error.message : 'Unknown error');
+    } finally {
+      setAiSuggestingGroups(false);
+    }
+  };
+
   const buildResolutions = () => {
-    if (!previewData || Object.keys(categoryResolutions).length === 0) return {};
-    const resolutions: Record<string, { category_id: number } | { category_name: string; category_parent?: string }> = {};
+    if (!previewData) return {};
+    const resolutions: Record<string, any> = {};
     previewData.rows.forEach((row: any) => {
-      const resolution = row.category_raw ? categoryResolutions[row.category_raw] : undefined;
-      if (!resolution) return;
-      resolutions[String(row.occurrence_of_row)] =
-        'categoryId' in resolution
-          ? { category_id: resolution.categoryId }
-          : { category_name: resolution.categoryName, category_parent: resolution.categoryParent };
+      const categoryResolution = row.category_raw ? categoryResolutions[row.category_raw] : undefined;
+      const groupId = groupResolutions[row.name];
+      if (!categoryResolution && !groupId) return;
+      const key = String(row.occurrence_of_row);
+      resolutions[key] = {
+        ...(categoryResolution
+          ? 'categoryId' in categoryResolution
+            ? { category_id: categoryResolution.categoryId }
+            : { category_name: categoryResolution.categoryName, category_parent: categoryResolution.categoryParent }
+          : {}),
+        ...(groupId ? { obligation_group_id: groupId } : {}),
+      };
     });
     return resolutions;
   };
@@ -306,7 +377,8 @@ export function ImportObligations() {
       setApplyResult(data);
       const matched = data.auto_matched_transactions || 0;
       showSuccess(
-        `Imported: ${data.created} created, ${data.blocked} flagged as possible duplicates` +
+        `Imported: ${data.created} new bill(s), ${data.attached} extended, ` +
+        `${data.occurrences_created} occurrence(s) added, ${data.occurrences_blocked} flagged as possible duplicates` +
         (matched > 0 ? `, ${matched} auto-matched to existing transactions` : '')
       );
     } catch (error) {
@@ -340,6 +412,23 @@ export function ImportObligations() {
     }
   };
 
+  const handleDeleteFormat = async (fmt: ObligationImportFormat) => {
+    const confirmed = await showConfirmDelete('Delete Saved Format', `Delete the saved format "${fmt.name}"?`);
+    if (!confirmed) return;
+    try {
+      const res = await fetch(`${IMPORT_API}formats/${fmt.obligation_import_format_id}/`, { method: 'DELETE' });
+      if (res.ok) {
+        showSuccess('Format deleted');
+        setSavedFormats((prev) => prev.filter((f) => f.obligation_import_format_id !== fmt.obligation_import_format_id));
+        if (selectedFormatId === String(fmt.obligation_import_format_id)) setSelectedFormatId('');
+      } else {
+        showError('Failed to delete format');
+      }
+    } catch (error) {
+      showError('Failed to delete format', error instanceof Error ? error.message : 'Unknown error');
+    }
+  };
+
   return (
     <div className="space-y-4">
       <div className="flex items-center gap-3">
@@ -360,19 +449,35 @@ export function ImportObligations() {
           {savedFormats.length > 0 && (
             <div>
               <label className="block text-sm font-medium mb-1">Use a saved format (optional)</label>
-              <Select
-                value={selectedFormatId ? [selectedFormatId] : []}
-                onUpdate={(val) => {
-                  const id = val[0] || '';
-                  setSelectedFormatId(id);
-                  const fmt = savedFormats.find((f) => String(f.obligation_import_format_id) === id);
-                  if (fmt) applySavedFormat(fmt);
-                }}
-                options={savedFormats.map((f) => ({ value: String(f.obligation_import_format_id), content: f.name }))}
-                placeholder="Choose a format…"
-                hasClear
-                width="max"
-              />
+              <div className="flex gap-2 items-start">
+                <div className="flex-1">
+                  <Select
+                    value={selectedFormatId ? [selectedFormatId] : []}
+                    onUpdate={(val) => {
+                      const id = val[0] || '';
+                      setSelectedFormatId(id);
+                      const fmt = savedFormats.find((f) => String(f.obligation_import_format_id) === id);
+                      if (fmt) applySavedFormat(fmt);
+                    }}
+                    options={savedFormats.map((f) => ({ value: String(f.obligation_import_format_id), content: f.name }))}
+                    placeholder="Choose a format…"
+                    hasClear
+                    width="max"
+                  />
+                </div>
+                {selectedFormatId && (
+                  <Button
+                    view="flat-danger"
+                    title="Delete saved format"
+                    onClick={() => {
+                      const fmt = savedFormats.find((f) => String(f.obligation_import_format_id) === selectedFormatId);
+                      if (fmt) handleDeleteFormat(fmt);
+                    }}
+                  >
+                    <Trash2 className="h-4 w-4" />
+                  </Button>
+                )}
+              </div>
             </div>
           )}
           <div>
@@ -511,9 +616,14 @@ export function ImportObligations() {
 
       {step === 'preview' && previewData && (
         <div className="bg-card border border-border rounded-lg p-4 space-y-4">
-          <div className="flex gap-4 text-sm">
-            <span className="font-semibold text-green-700 dark:text-green-400">{previewData.summary.new} new</span>
-            <span className="font-semibold text-amber-700 dark:text-amber-400">{previewData.summary.duplicates} possible duplicates</span>
+          <div className="flex gap-4 text-sm flex-wrap">
+            <span className="font-semibold text-green-700 dark:text-green-400">{previewData.summary.new_occurrences} new</span>
+            <span className="font-semibold text-amber-700 dark:text-amber-400">{previewData.summary.duplicate_occurrences} possible duplicates</span>
+            {previewData.summary.attached_obligations > 0 && (
+              <span className="text-muted-foreground">
+                ({previewData.summary.attached_obligations} bill{previewData.summary.attached_obligations === 1 ? '' : 's'} already exist — new occurrences will attach to {previewData.summary.attached_obligations === 1 ? 'it' : 'them'})
+              </span>
+            )}
             {previewData.summary.errors > 0 && (
               <span className="font-semibold text-red-700 dark:text-red-400">{previewData.summary.errors} errors</span>
             )}
@@ -562,6 +672,26 @@ export function ImportObligations() {
               {previewData.unmatched_payees?.length > 0 && (
                 <div>New payees that will be created: {previewData.unmatched_payees.join(', ')}</div>
               )}
+              {previewData.unmatched_group_names?.length > 0 && (
+                <div className="flex items-center justify-between gap-2">
+                  <span>Not linked to a group: {previewData.unmatched_group_names.join(', ')}</span>
+                  {aiEnabled && (
+                    <Button view="normal" size="s" loading={aiSuggestingGroups} onClick={() => handleAiSuggestGroups()}>
+                      <Sparkles className="mr-1.5 h-3.5 w-3.5" />
+                      AI Match to Group
+                    </Button>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+
+          {Object.keys(groupResolutions).length > 0 && (
+            <div className="text-sm bg-primary/5 border border-primary/20 rounded p-2">
+              <div className="font-medium mb-1">AI-matched to existing groups:</div>
+              {Object.entries(groupResolutions).map(([raw, id]) => (
+                <div key={raw}>{raw} → {groupNames[id] || `#${id}`}</div>
+              ))}
             </div>
           )}
 
@@ -573,7 +703,9 @@ export function ImportObligations() {
                   <th className="py-1 px-2">Name</th>
                   <th className="py-1 px-2 text-right">Amount</th>
                   <th className="py-1 px-2">Due Date</th>
+                  <th className="py-1 px-2">Month/Year</th>
                   <th className="py-1 px-2">Category</th>
+                  <th className="py-1 px-2">Group</th>
                   <th className="py-1 px-2">Type</th>
                   <th className="py-1 px-2">Recurring</th>
                   <th className="py-1 px-2">Status</th>
@@ -586,6 +718,7 @@ export function ImportObligations() {
                     <td className="py-1 px-2">{row.name}</td>
                     <td className="py-1 px-2 text-right">{row.amount}</td>
                     <td className="py-1 px-2">{row.due_date || '—'}</td>
+                    <td className="py-1 px-2 text-muted-foreground">{row.period || '—'}</td>
                     <td className="py-1 px-2">
                       {row.category_raw ? (
                         (() => {
@@ -597,6 +730,13 @@ export function ImportObligations() {
                           return `${row.category_raw} → ${resolution.categoryName} (new)`;
                         })()
                       ) : '—'}
+                    </td>
+                    <td className="py-1 px-2">
+                      {(() => {
+                        const groupId = groupResolutions[row.name] ?? row.obligation_group_id;
+                        if (!groupId) return '—';
+                        return groupNames[groupId] || row.obligation_group_name || `#${groupId}`;
+                      })()}
                     </td>
                     <td className="py-1 px-2">{row.direction === 'receivable' ? 'Receivable' : 'Payable'}</td>
                     <td className="py-1 px-2">{row.is_recurring ? row.recurrence : 'one-off'}</td>
@@ -627,13 +767,15 @@ export function ImportObligations() {
             <div className="flex justify-between">
               <Button view="normal" onClick={() => setStep('mapping')}>Back to Mapping</Button>
               <Button view="action" loading={applying} onClick={handleApply}>
-                Import {previewData.summary.new + previewData.summary.duplicates} Obligation(s)
+                Import {previewData.summary.rows} Occurrence(s)
               </Button>
             </div>
           ) : (
             <div className="flex justify-between items-center">
               <span className="text-sm text-muted-foreground">
-                Created {applyResult.created}, flagged {applyResult.blocked} as possible duplicates
+                {applyResult.created} new bill{applyResult.created === 1 ? '' : 's'} created
+                {applyResult.attached > 0 ? `, ${applyResult.attached} existing bill${applyResult.attached === 1 ? '' : 's'} extended` : ''}
+                {' — '}{applyResult.occurrences_created} occurrence(s) added, {applyResult.occurrences_blocked} flagged as possible duplicates
                 {applyResult.auto_matched_transactions > 0
                   ? `, auto-matched ${applyResult.auto_matched_transactions} to existing transactions.`
                   : '.'}

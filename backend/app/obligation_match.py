@@ -16,12 +16,14 @@ from datetime import timedelta
 from itertools import combinations
 from typing import Optional
 
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session, joinedload
 
-from app.models import Obligation, ObligationOccurrence, ObligationOccurrenceTransaction, Transaction
+from app.models import Obligation, ObligationOccurrence, ObligationOccurrenceTransaction, Payee, Transaction
 
 _AMOUNT_TOLERANCE = 0.01
 _MAX_CANDIDATES = 40
+_MAX_SEARCH_CANDIDATES = 150
 _MAX_COMBO_POOL = 20
 _AUTO_ASSIGN_TOLERANCE = 0.01
 
@@ -32,12 +34,26 @@ def find_candidate_transactions(
     window_days_before: int = 14,
     window_days_after: int = 45,
     unassigned_only: bool = True,
+    search: Optional[str] = None,
+    min_amount: Optional[float] = None,
+    max_amount: Optional[float] = None,
+    ignore_direction: bool = False,
+    all_time: bool = False,
 ) -> list[Transaction]:
     """Transactions in a date window around the occurrence's due date, softly
     filtered by the obligation's category/payee (only when that doesn't wipe
-    out the pool -- a bill's real transaction often isn't tagged identically)."""
+    out the pool -- a bill's real transaction often isn't tagged identically).
+
+    ``search``/``min_amount``/``max_amount``/``ignore_direction``/``all_time``
+    are an escape hatch for "the real transaction isn't in the suggested
+    list" -- any of them being set puts this in explicit search mode, which
+    widens the date window (unless overridden) and skips the soft category/
+    payee narrowing entirely (that narrowing exists to sharpen the default
+    suggestion list, not to fight a search the user is deliberately widening).
+    """
     obligation = occurrence.obligation
     due = occurrence.due_date
+    searching = bool(search) or min_amount is not None or max_amount is not None or ignore_direction or all_time
 
     query = db.query(Transaction).options(
         joinedload(Transaction.category),
@@ -53,13 +69,15 @@ def find_candidate_transactions(
     # receivable (income) can only ever be covered by an incoming/positive
     # transaction, and a payable (bill) only by an outgoing/negative one --
     # this isn't a preference to fall back from, it's what the numbers mean.
-    if obligation is not None:
+    # ``ignore_direction`` is an explicit manual override for the rare case
+    # the obligation's own direction was set wrong.
+    if obligation is not None and not ignore_direction:
         if obligation.direction == "receivable":
             query = query.filter(Transaction.amount > 0)
         else:
             query = query.filter(Transaction.amount < 0)
 
-    if due is not None:
+    if due is not None and not all_time:
         start = due - timedelta(days=window_days_before)
         end = due + timedelta(days=window_days_after)
         query = query.filter(
@@ -75,16 +93,27 @@ def find_candidate_transactions(
             )
         )
 
+    if search:
+        like = f"%{search}%"
+        query = query.filter(
+            or_(Transaction.comment.ilike(like), Transaction.payee.has(Payee.name.ilike(like)))
+        )
+    if min_amount is not None:
+        query = query.filter(func.abs(Transaction.amount) >= min_amount)
+    if max_amount is not None:
+        query = query.filter(func.abs(Transaction.amount) <= max_amount)
+
     candidates = query.order_by(Transaction.cash.desc().nullslast(), Transaction.entry.desc()).all()
 
-    if obligation and obligation.category_id:
-        narrowed = [t for t in candidates if t.category_id == obligation.category_id]
-        if narrowed:
-            candidates = narrowed
-    if obligation and obligation.payee_id:
-        narrowed = [t for t in candidates if t.payee_id == obligation.payee_id]
-        if narrowed:
-            candidates = narrowed
+    if not searching:
+        if obligation and obligation.category_id:
+            narrowed = [t for t in candidates if t.category_id == obligation.category_id]
+            if narrowed:
+                candidates = narrowed
+        if obligation and obligation.payee_id:
+            narrowed = [t for t in candidates if t.payee_id == obligation.payee_id]
+            if narrowed:
+                candidates = narrowed
 
     # Shortlist by proximity to the obligation's due date -- a bill is far
     # more likely paid within a few days of it than merely "most recent";
@@ -93,7 +122,7 @@ def find_candidate_transactions(
     if due is not None:
         candidates.sort(key=lambda t: abs((t.date - due).days) if t.date else 10**6)
 
-    return candidates[:_MAX_CANDIDATES]
+    return candidates[: _MAX_SEARCH_CANDIDATES if searching else _MAX_CANDIDATES]
 
 
 def find_matching_subsets(

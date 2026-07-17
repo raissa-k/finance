@@ -420,11 +420,47 @@ class ObligationImportFormatResponse(BaseModel):
     fields: List[ObligationImportFormatFieldResponse]
 
 
+class ObligationGroupCreate(BaseModel):
+    name: str
+    category_id: Optional[int] = None
+    direction: Literal["payable", "receivable"] = "payable"
+    recurrence: Optional[Literal["weekly", "monthly", "yearly"]] = None
+    # Informational only (not currently used to compute occurrence due dates):
+    # one or the other depending on recurrence, e.g. 15 for "the 15th of every
+    # month", "friday" for "every Friday".
+    expected_day_of_month: Optional[int] = Field(None, ge=1, le=31)
+    expected_weekday: Optional[
+        Literal["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+    ] = None
+
+
+class ObligationGroupUpdate(ObligationGroupCreate):
+    pass
+
+
+class ObligationGroupResponse(BaseModel):
+    obligation_group_id: int
+    name: str
+    category_id: Optional[int]
+    category_name: Optional[str]
+    direction: str
+    recurrence: Optional[str]
+    expected_day_of_month: Optional[int]
+    expected_weekday: Optional[str]
+    created_at: datetime
+    obligation_count: int
+
+
+class ObligationGroupSyncResponse(BaseModel):
+    updated: int
+
+
 class ObligationOccurrenceResponse(BaseModel):
     obligation_occurrence_id: int
     obligation_id: int
     obligation_name: str
     due_date: Optional[date]
+    period: Optional[str]
     estimated_amount: Optional[float]
     paid: bool
     paid_at: Optional[datetime]
@@ -446,6 +482,7 @@ class ObligationOccurrenceResponse(BaseModel):
 
 class ObligationOccurrenceCreate(BaseModel):
     due_date: Optional[date] = None
+    period: Optional[str] = None
     estimated_amount: Optional[float] = None
     note: Optional[str] = None
     paid: bool = False
@@ -453,6 +490,7 @@ class ObligationOccurrenceCreate(BaseModel):
 
 class ObligationOccurrenceUpdate(BaseModel):
     due_date: Optional[date] = None
+    period: Optional[str] = None
     estimated_amount: Optional[float] = None
     note: Optional[str] = None
     paid_date: Optional[date] = None
@@ -469,10 +507,21 @@ class ObligationTransactionIdsRequest(BaseModel):
     transaction_ids: List[int]
 
 
+class ObligationOccurrenceIdsRequest(BaseModel):
+    occurrence_ids: List[int]
+
+
+class ObligationOccurrenceBulkDeleteResponse(BaseModel):
+    deleted: int
+    skipped: int
+    skipped_ids: List[int]
+
+
 class ObligationCreate(BaseModel):
     name: str
     category_id: Optional[int] = None
     payee_id: Optional[int] = None
+    obligation_group_id: Optional[int] = None
     is_recurring: bool = False
     recurrence: Optional[str] = None
     estimated_amount: Optional[float] = None
@@ -491,6 +540,7 @@ class ObligationUpdate(BaseModel):
     name: str
     category_id: Optional[int] = None
     payee_id: Optional[int] = None
+    obligation_group_id: Optional[int] = None
     is_recurring: bool = False
     recurrence: Optional[str] = None
     estimated_amount: Optional[float] = None
@@ -506,6 +556,8 @@ class ObligationResponse(BaseModel):
     category_name: Optional[str]
     payee_id: Optional[int]
     payee_name: Optional[str]
+    obligation_group_id: Optional[int]
+    obligation_group_name: Optional[str]
     is_recurring: bool
     recurrence: Optional[str]
     estimated_amount: Optional[float]
@@ -535,6 +587,10 @@ class ObligationSuggestCategoriesRequest(BaseModel):
 
 
 class ObligationMatchCategoriesRequest(BaseModel):
+    labels: List[str]
+
+
+class ObligationMatchGroupsRequest(BaseModel):
     labels: List[str]
 
 

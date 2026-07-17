@@ -26,7 +26,7 @@ import urllib.request
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.models import Category, Payee
+from app.models import Category, ObligationGroup, Payee
 
 logger = logging.getLogger("ai_categorize")
 
@@ -442,6 +442,93 @@ def suggest_category_matches(db: Session, labels: list[str]) -> list[dict]:
         except (ValueError, KeyError, json.JSONDecodeError) as exc:
             logger.error("Failed to parse category-match response: %s", exc)
             raise AICategorizationError("Could not parse the category-match response.") from exc
+
+    return results
+
+
+SYSTEM_PROMPT_GROUP_MATCH = (
+    "You match a raw bill/obligation name -- from a personal-finance spreadsheet import -- "
+    "to the closest EXISTING recurring-obligation GROUP name in this app, if any. A group is "
+    "a reusable template for one recurring bill (e.g. \"Aluguel\", \"Netflix\", \"Salário\"). "
+    "Judge by meaning/spelling similarity (abbreviations, minor wording differences, accents), "
+    "not exact string equality -- e.g. 'ALUGUEL APTO CENTRO' should match an existing group "
+    "named 'Aluguel'.\n"
+    "You are given the full list of existing group names. For each label, return the single "
+    "existing group name that clearly refers to the SAME recurring bill, or null if truly "
+    "nothing matches (do not force a weak match, and never invent a new group name -- groups "
+    "are only ever created manually by the user, not by this matching step).\n"
+    "Respond with ONLY a JSON array, one object per label, in the same order, shaped exactly: "
+    '{"index": <int>, "group": <string|null>}. group must be copied EXACTLY as it appears in '
+    "the existing group names list. No prose, no code fences."
+)
+
+
+def _group_context(db: Session):
+    groups = db.query(ObligationGroup).all()
+    options = [g.name for g in groups]
+    lookup = {_fold(g.name): g.obligation_group_id for g in groups}
+    return options, lookup
+
+
+def _match_group_chunk(provider, lookup, chunk, context_text) -> list[dict]:
+    items_text = "Labels to match:\n" + json.dumps(chunk, ensure_ascii=False)
+    if provider == "anthropic":
+        raw = _call_anthropic(
+            context_text,
+            items_text,
+            min(16000, 400 + 60 * len(chunk)),
+            system_prompt=SYSTEM_PROMPT_GROUP_MATCH,
+        )
+    else:
+        raw = _call_gemini(context_text, items_text, system_prompt=SYSTEM_PROMPT_GROUP_MATCH)
+
+    parsed = _extract_json_array(raw)
+    results = []
+    for item in parsed:
+        if not isinstance(item, dict) or "index" not in item:
+            continue
+        group_name = item.get("group")
+        group_name = group_name.strip() if isinstance(group_name, str) and group_name.strip() else None
+        group_id = lookup.get(_fold(group_name)) if group_name else None
+        results.append({"index": item["index"], "obligation_group_id": group_id})
+    return results
+
+
+def suggest_group_matches(db: Session, labels: list[str]) -> list[dict]:
+    """Match raw obligation names (e.g. from a spreadsheet import) to an
+    EXISTING ObligationGroup by name/spelling similarity (not translation --
+    unlike category matching, both sides are typically the same language).
+
+    Returns ``{index, obligation_group_id}`` per label, in the same order.
+    ``obligation_group_id`` is ``None`` when nothing existing is a good match
+    -- this never proposes creating a new group; groups are only ever
+    created manually by the user.
+    """
+    provider = resolve_provider()
+    if provider is None:
+        raise AICategorizationError(
+            "AI categorization is not configured (set ANTHROPIC_API_KEY or GEMINI_API_KEY)."
+        )
+    if not labels:
+        return []
+
+    options, lookup = _group_context(db)
+    if not options:
+        return [{"index": i, "obligation_group_id": None} for i in range(len(labels))]
+
+    context_text = "Existing obligation group names:\n" + json.dumps({"groups": options}, ensure_ascii=False)
+
+    items = [{"index": i, "label": label} for i, label in enumerate(labels)]
+    results: list[dict] = []
+    for start in range(0, len(items), CHUNK_SIZE):
+        chunk = items[start : start + CHUNK_SIZE]
+        try:
+            results.extend(_match_group_chunk(provider, lookup, chunk, context_text))
+        except AICategorizationError:
+            raise
+        except (ValueError, KeyError, json.JSONDecodeError) as exc:
+            logger.error("Failed to parse group-match response: %s", exc)
+            raise AICategorizationError("Could not parse the group-match response.") from exc
 
     return results
 

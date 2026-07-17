@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { flushSync } from 'react-dom';
-import { Button, Dialog, TextInput, Checkbox, Select } from '@gravity-ui/uikit';
+import { Button, Dialog, TextInput, Checkbox, Select, TabProvider, TabList, Tab } from '@gravity-ui/uikit';
 import {
   ChevronRight,
   ChevronDown,
@@ -14,14 +14,24 @@ import {
   Link2,
   Sparkles,
   Upload,
+  Layers,
 } from 'lucide-react';
-import { showError, showSuccess, showConfirmDelete } from '@/utils/notifications';
+import { showError, showSuccess, showConfirm, showConfirmDelete } from '@/utils/notifications';
 import { formatAmount, formatDate } from '@/utils/format';
 import { useDisplaySettings } from '@/contexts/DisplaySettingsContext';
-import type { Obligation, ObligationOccurrence } from '@/types';
+import type { Obligation, ObligationGroup, ObligationOccurrence } from '@/types';
 
 const API = '/api/obligations/';
 const OCC_API = '/api/obligation-occurrences/';
+const GROUP_API = '/api/obligation-groups/';
+
+const MONTH_OPTIONS = [
+  { value: '', content: '(any month)' },
+  ...[
+    'January', 'February', 'March', 'April', 'May', 'June',
+    'July', 'August', 'September', 'October', 'November', 'December',
+  ].map((name, i) => ({ value: String(i + 1), content: name })),
+];
 
 type CategoryOption = { category_id: number; name: string; parent_category_id: number | null; merged_into_category_id?: number | null };
 type PayeeOption = { payee_id: number; name: string; merged_into_payee_id?: number | null };
@@ -101,15 +111,21 @@ interface AssignDialogState {
   loading: boolean;
   aiLoading: boolean;
   aiExplanation: string | null;
+  searching: boolean; // true once the candidate list reflects a manual search, not just the default suggestions
 }
+
+const emptySearchForm = { text: '', minAmount: '', maxAmount: '', allTime: false, ignoreDirection: false };
 
 export function Obligations() {
   const { defaultLocale, defaultCurrencySymbol } = useDisplaySettings();
+  const [activeTab, setActiveTab] = useState<'obligations' | 'occurrences'>('obligations');
   const [obligations, setObligations] = useState<Obligation[]>([]);
   const [loading, setLoading] = useState(false);
   const [showBlocked, setShowBlocked] = useState(false);
+  const [showPaidNested, setShowPaidNested] = useState(false);
   const [categories, setCategories] = useState<CategoryOption[]>([]);
   const [payees, setPayees] = useState<PayeeOption[]>([]);
+  const [groups, setGroups] = useState<ObligationGroup[]>([]);
 
   const [expandedIds, setExpandedIds] = useState<Record<number, boolean>>({});
   const [detailsById, setDetailsById] = useState<Record<number, Obligation>>({});
@@ -120,6 +136,7 @@ export function Obligations() {
     name: '',
     category_id: '' as string | number,
     payee_id: '' as string | number,
+    obligation_group_id: '' as string | number,
     is_recurring: false,
     recurrence: 'monthly',
     estimated_amount: '',
@@ -131,6 +148,50 @@ export function Obligations() {
   const [aiSuggesting, setAiSuggesting] = useState(false);
 
   const [assignDialog, setAssignDialog] = useState<AssignDialogState | null>(null);
+  const [searchForm, setSearchForm] = useState(emptySearchForm);
+  const [searchingCandidates, setSearchingCandidates] = useState(false);
+
+  // ── Edit Occurrence (touches both the occurrence and its parent Obligation:
+  // name/category/type/group are shared across all sibling occurrences by
+  // design, so editing them here edits the Obligation, not just this row) ──
+  const [editOccDialog, setEditOccDialog] = useState<{ occ: ObligationOccurrence; obligation: Obligation } | null>(null);
+  const [occFormData, setOccFormData] = useState({
+    period: '',
+    name: '',
+    category_id: '' as string | number,
+    direction: 'payable' as 'payable' | 'receivable',
+    obligation_group_id: '' as string | number,
+    due_date: '',
+    paid_date: '',
+    note: '',
+    estimated_amount: '',
+  });
+
+  // ── Groups management ────────────────────────────────────────────────────
+  const [isGroupsModalOpen, setIsGroupsModalOpen] = useState(false);
+  const [isGroupFormOpen, setIsGroupFormOpen] = useState(false);
+  const [editingGroup, setEditingGroup] = useState<ObligationGroup | null>(null);
+  const [groupFormData, setGroupFormData] = useState({
+    name: '',
+    category_id: '' as string | number,
+    direction: 'payable' as 'payable' | 'receivable',
+    is_recurring: false,
+    recurrence: 'monthly',
+    expected_day_of_month: '',
+    expected_weekday: '',
+  });
+
+  // ── Flat Occurrences tab ─────────────────────────────────────────────────
+  const [occurrences, setOccurrences] = useState<ObligationOccurrence[]>([]);
+  const [occLoading, setOccLoading] = useState(false);
+  const [occStatusFilter, setOccStatusFilter] = useState<'all' | 'pending' | 'late'>('all');
+  const [showPaidOcc, setShowPaidOcc] = useState(false);
+  const [occYear, setOccYear] = useState('');
+  const [occMonth, setOccMonth] = useState('');
+  const [occSearch, setOccSearch] = useState('');
+  const [occDirection, setOccDirection] = useState<'' | 'payable' | 'receivable'>('');
+  const [occCategoryId, setOccCategoryId] = useState('');
+  const [selectedOccIds, setSelectedOccIds] = useState<Set<number>>(new Set());
 
   const fetchAll = async () => {
     setLoading(true);
@@ -161,10 +222,93 @@ export function Obligations() {
     }
   };
 
+  const fetchGroups = async () => {
+    try {
+      const res = await fetch(GROUP_API);
+      const data = await res.json();
+      setGroups(data.results || []);
+    } catch (error) {
+      showError('Failed to load obligation groups', error instanceof Error ? error.message : 'Unknown error');
+    }
+  };
+
+  const fetchOccurrences = async () => {
+    setOccLoading(true);
+    try {
+      const params = new URLSearchParams();
+      if (occStatusFilter === 'pending') params.set('status', 'pending');
+      else if (occStatusFilter === 'late') params.set('status', 'late');
+      else if (!showPaidOcc) params.set('paid', 'false');
+      if (occYear) params.set('year', occYear);
+      if (occMonth) params.set('month', occMonth);
+      if (occSearch.trim()) params.set('search', occSearch.trim());
+      if (occDirection) params.set('direction', occDirection);
+      if (occCategoryId) params.set('category_id', occCategoryId);
+
+      const res = await fetch(`${OCC_API}?${params.toString()}`);
+      if (!res.ok) throw new Error(`Failed to fetch occurrences: ${res.statusText}`);
+      const data = await res.json();
+      setOccurrences(data.results || []);
+      setSelectedOccIds(new Set()); // selection is filter-scoped, cleared on every refetch
+    } catch (error) {
+      showError('Failed to load occurrences', error instanceof Error ? error.message : 'Unknown error');
+    } finally {
+      setOccLoading(false);
+    }
+  };
+
+  const toggleOccSelected = (id: number) => {
+    setSelectedOccIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const toggleAllOccSelected = () => {
+    setSelectedOccIds((prev) => (prev.size === occurrences.length ? new Set() : new Set(occurrences.map((o) => o.obligation_occurrence_id))));
+  };
+
+  const handleBulkDeleteOccurrences = async () => {
+    if (selectedOccIds.size === 0) return;
+    const confirmed = await showConfirmDelete(
+      'Delete Occurrences',
+      `Delete ${selectedOccIds.size} selected occurrence(s)? Any with assigned transactions will be skipped.`
+    );
+    if (!confirmed) return;
+    try {
+      const res = await fetch(`${OCC_API}bulk-delete/`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ occurrence_ids: Array.from(selectedOccIds) }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        showError('Failed to delete occurrences', data.detail || 'Unknown error');
+        return;
+      }
+      showSuccess(
+        `Deleted ${data.deleted} occurrence(s)` +
+        (data.skipped > 0 ? `, skipped ${data.skipped} (assigned transactions or a linked duplicate)` : '')
+      );
+      await fetchOccurrences();
+      await fetchAll();
+    } catch (error) {
+      showError('Failed to delete occurrences', error instanceof Error ? error.message : 'Unknown error');
+    }
+  };
+
   useEffect(() => {
     fetchAll();
     fetchLookups();
+    fetchGroups();
   }, []);
+
+  useEffect(() => {
+    if (activeTab === 'occurrences') fetchOccurrences();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab, occStatusFilter, showPaidOcc, occYear, occMonth, occSearch, occDirection, occCategoryId]);
 
   const blockedCount = useMemo(() => obligations.filter((o) => o.is_blocked).length, [obligations]);
 
@@ -228,6 +372,7 @@ export function Obligations() {
   const refreshDetail = async (obligationId: number) => {
     await fetchDetail(obligationId);
     await fetchAll();
+    if (activeTab === 'occurrences') await fetchOccurrences();
   };
 
   // ── Create / edit ────────────────────────────────────────────────────────
@@ -238,6 +383,7 @@ export function Obligations() {
       name: '',
       category_id: '',
       payee_id: '',
+      obligation_group_id: '',
       is_recurring: false,
       recurrence: 'monthly',
       estimated_amount: '',
@@ -255,6 +401,7 @@ export function Obligations() {
       name: ob.name,
       category_id: ob.category_id ?? '',
       payee_id: ob.payee_id ?? '',
+      obligation_group_id: ob.obligation_group_id ?? '',
       is_recurring: ob.is_recurring,
       recurrence: ob.recurrence || 'monthly',
       estimated_amount: ob.estimated_amount !== null ? String(ob.estimated_amount) : '',
@@ -289,6 +436,7 @@ export function Obligations() {
       name: formData.name.trim(),
       category_id: formData.category_id ? Number(formData.category_id) : null,
       payee_id: formData.payee_id ? Number(formData.payee_id) : null,
+      obligation_group_id: formData.obligation_group_id ? Number(formData.obligation_group_id) : null,
       is_recurring: formData.is_recurring,
       recurrence: formData.is_recurring ? formData.recurrence : null,
       estimated_amount: formData.estimated_amount ? Number(formData.estimated_amount) : null,
@@ -394,6 +542,129 @@ export function Obligations() {
     }
   };
 
+  // ── Groups ────────────────────────────────────────────────────────────────
+
+  const groupOptions = useMemo(
+    () => [
+      { value: '', content: '(none)' },
+      ...groups
+        .map((g) => ({ value: String(g.obligation_group_id), content: g.name }))
+        .sort((a, b) => a.content.localeCompare(b.content)),
+    ],
+    [groups]
+  );
+
+  const openCreateGroupForm = () => {
+    setEditingGroup(null);
+    setGroupFormData({
+      name: '',
+      category_id: '',
+      direction: 'payable',
+      is_recurring: false,
+      recurrence: 'monthly',
+      expected_day_of_month: '',
+      expected_weekday: '',
+    });
+    setIsGroupFormOpen(true);
+  };
+
+  const openEditGroupForm = (g: ObligationGroup) => {
+    setEditingGroup(g);
+    setGroupFormData({
+      name: g.name,
+      category_id: g.category_id ?? '',
+      direction: g.direction,
+      is_recurring: !!g.recurrence,
+      recurrence: g.recurrence || 'monthly',
+      expected_day_of_month: g.expected_day_of_month !== null ? String(g.expected_day_of_month) : '',
+      expected_weekday: g.expected_weekday || '',
+    });
+    setIsGroupFormOpen(true);
+  };
+
+  const closeGroupForm = () => {
+    setIsGroupFormOpen(false);
+    setEditingGroup(null);
+  };
+
+  const handleGroupSubmit = async () => {
+    if (!groupFormData.name.trim()) {
+      showError('Please enter a name');
+      return;
+    }
+    const isEditing = !!editingGroup;
+    const url = isEditing ? `${GROUP_API}${editingGroup!.obligation_group_id}/` : GROUP_API;
+    const payload = {
+      name: groupFormData.name.trim(),
+      category_id: groupFormData.category_id ? Number(groupFormData.category_id) : null,
+      direction: groupFormData.direction,
+      recurrence: groupFormData.is_recurring ? groupFormData.recurrence : null,
+      expected_day_of_month:
+        groupFormData.recurrence === 'monthly' && groupFormData.expected_day_of_month
+          ? Number(groupFormData.expected_day_of_month)
+          : null,
+      expected_weekday: groupFormData.recurrence === 'weekly' ? groupFormData.expected_weekday || null : null,
+    };
+    try {
+      const res = await fetch(url, {
+        method: isEditing ? 'PUT' : 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (res.ok) {
+        showSuccess(`Group ${isEditing ? 'updated' : 'created'}`);
+        closeGroupForm();
+        await fetchGroups();
+      } else {
+        const err = await res.json();
+        showError(`Failed to ${isEditing ? 'update' : 'create'} group`, err.detail || 'Unknown error');
+      }
+    } catch (error) {
+      showError(`Failed to ${isEditing ? 'update' : 'create'} group`, error instanceof Error ? error.message : 'Unknown error');
+    }
+  };
+
+  const handleDeleteGroup = async (g: ObligationGroup) => {
+    const confirmed = await showConfirmDelete(
+      'Delete Group',
+      `Delete "${g.name}"? ${g.obligation_count} linked obligation(s) will be kept, just unlinked from this group.`
+    );
+    if (!confirmed) return;
+    try {
+      const res = await fetch(`${GROUP_API}${g.obligation_group_id}/`, { method: 'DELETE' });
+      if (res.ok) {
+        showSuccess('Group deleted');
+        await fetchGroups();
+        await fetchAll();
+      } else {
+        showError('Failed to delete group');
+      }
+    } catch (error) {
+      showError('Failed to delete group', error instanceof Error ? error.message : 'Unknown error');
+    }
+  };
+
+  const handleSyncGroup = async (g: ObligationGroup) => {
+    const confirmed = await showConfirm({
+      title: 'Sync Group to Obligations',
+      content: `Overwrite category/type/cadence on all ${g.obligation_count} obligation(s) linked to "${g.name}" with the group's current settings? This cannot be undone automatically.`,
+      okText: 'Sync',
+    });
+    if (!confirmed) return;
+    try {
+      const res = await fetch(`${GROUP_API}${g.obligation_group_id}/sync/`, { method: 'POST' });
+      const data = await res.json();
+      if (res.ok) {
+        showSuccess(`Synced ${data.updated} obligation(s) to "${g.name}"`);
+        await fetchAll();
+      } else {
+        showError('Failed to sync group', data.detail || 'Unknown error');
+      }
+    } catch (error) {
+      showError('Failed to sync group', error instanceof Error ? error.message : 'Unknown error');
+    }
+  };
+
   // ── Occurrence actions ───────────────────────────────────────────────────
 
   const handleTogglePaid = async (occ: ObligationOccurrence) => {
@@ -421,6 +692,7 @@ export function Obligations() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           due_date: occ.due_date,
+          period: occ.period,
           estimated_amount: occ.estimated_amount,
           note: occ.note,
           paid_date: newDate || null,
@@ -433,6 +705,89 @@ export function Obligations() {
       }
     } catch (error) {
       showError('Failed to update paid date', error instanceof Error ? error.message : 'Unknown error');
+    }
+  };
+
+  const openEditOccDialog = (occ: ObligationOccurrence, obligationHint?: Obligation) => {
+    const ob = obligationHint || obligations.find((o) => o.obligation_id === occ.obligation_id);
+    if (!ob) {
+      showError('Could not find the parent obligation for this occurrence');
+      return;
+    }
+    setEditOccDialog({ occ, obligation: ob });
+    setOccFormData({
+      period: occ.period || '',
+      name: ob.name,
+      category_id: ob.category_id ?? '',
+      direction: ob.direction,
+      obligation_group_id: ob.obligation_group_id ?? '',
+      due_date: occ.due_date || '',
+      paid_date: occ.paid_date || '',
+      note: occ.note || '',
+      estimated_amount: occ.estimated_amount !== null ? String(occ.estimated_amount) : '',
+    });
+  };
+
+  const closeEditOccDialog = () => setEditOccDialog(null);
+
+  const handleEditOccSubmit = async () => {
+    if (!editOccDialog) return;
+    if (!occFormData.name.trim()) {
+      showError('Please enter a name');
+      return;
+    }
+    const { occ, obligation: ob } = editOccDialog;
+    try {
+      const occRes = await fetch(`${OCC_API}${occ.obligation_occurrence_id}/`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          due_date: occFormData.due_date || null,
+          period: occFormData.period || null,
+          estimated_amount: occFormData.estimated_amount ? Number(occFormData.estimated_amount) : null,
+          note: occFormData.note || null,
+          paid_date: occFormData.paid_date || null,
+        }),
+      });
+      if (!occRes.ok) {
+        const err = await occRes.json();
+        showError('Failed to update occurrence', err.detail || 'Unknown error');
+        return;
+      }
+
+      // name/category/type/group are shared across every sibling occurrence
+      // of this Obligation by design (see ObligationGroup) -- editing them
+      // here updates the Obligation itself, not just this one row. Every
+      // other Obligation field is echoed back unchanged.
+      const obRes = await fetch(`${API}${ob.obligation_id}/`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: occFormData.name.trim(),
+          category_id: occFormData.category_id ? Number(occFormData.category_id) : null,
+          payee_id: ob.payee_id,
+          obligation_group_id: occFormData.obligation_group_id ? Number(occFormData.obligation_group_id) : null,
+          is_recurring: ob.is_recurring,
+          recurrence: ob.recurrence,
+          estimated_amount: ob.estimated_amount,
+          note: ob.note,
+          is_active: ob.is_active,
+          direction: occFormData.direction,
+        }),
+      });
+      if (!obRes.ok) {
+        const err = await obRes.json();
+        showError('Failed to update obligation', err.detail || 'Unknown error');
+        return;
+      }
+
+      showSuccess('Occurrence updated');
+      closeEditOccDialog();
+      await fetchAll();
+      await fetchDetail(occ.obligation_id);
+      if (activeTab === 'occurrences') await fetchOccurrences();
+    } catch (error) {
+      showError('Failed to update occurrence', error instanceof Error ? error.message : 'Unknown error');
     }
   };
 
@@ -487,7 +842,8 @@ export function Obligations() {
   // ── Assign transactions dialog ───────────────────────────────────────────
 
   const openAssignDialog = async (occ: ObligationOccurrence) => {
-    setAssignDialog({ occurrence: occ, assigned: [], candidates: [], selected: new Set(), loading: true, aiLoading: false, aiExplanation: null });
+    setSearchForm(emptySearchForm);
+    setAssignDialog({ occurrence: occ, assigned: [], candidates: [], selected: new Set(), loading: true, aiLoading: false, aiExplanation: null, searching: false });
     try {
       const [assignedRes, candidatesRes] = await Promise.all([
         fetch(`${OCC_API}${occ.obligation_occurrence_id}/assigned-transactions/`),
@@ -507,6 +863,48 @@ export function Obligations() {
   };
 
   const closeAssignDialog = () => setAssignDialog(null);
+
+  const handleSearchCandidates = async () => {
+    if (!assignDialog) return;
+    setSearchingCandidates(true);
+    try {
+      const params = new URLSearchParams();
+      if (searchForm.text.trim()) params.set('search', searchForm.text.trim());
+      if (searchForm.minAmount) params.set('min_amount', searchForm.minAmount);
+      if (searchForm.maxAmount) params.set('max_amount', searchForm.maxAmount);
+      if (searchForm.allTime) params.set('all_time', 'true');
+      if (searchForm.ignoreDirection) params.set('ignore_direction', 'true');
+
+      const res = await fetch(
+        `${OCC_API}${assignDialog.occurrence.obligation_occurrence_id}/candidate-transactions/?${params.toString()}`
+      );
+      const data = await res.json();
+      if (!res.ok) {
+        showError('Search failed', data.detail || 'Unknown error');
+        return;
+      }
+      setAssignDialog((prev) => (prev ? { ...prev, candidates: data.results || [], searching: true } : prev));
+    } catch (error) {
+      showError('Search failed', error instanceof Error ? error.message : 'Unknown error');
+    } finally {
+      setSearchingCandidates(false);
+    }
+  };
+
+  const handleResetCandidateSearch = async () => {
+    if (!assignDialog) return;
+    setSearchForm(emptySearchForm);
+    setSearchingCandidates(true);
+    try {
+      const res = await fetch(`${OCC_API}${assignDialog.occurrence.obligation_occurrence_id}/candidate-transactions/`);
+      const data = await res.json();
+      setAssignDialog((prev) => (prev ? { ...prev, candidates: data.results || [], searching: false } : prev));
+    } catch (error) {
+      showError('Failed to reset search', error instanceof Error ? error.message : 'Unknown error');
+    } finally {
+      setSearchingCandidates(false);
+    }
+  };
 
   const toggleCandidate = (txId: number) => {
     setAssignDialog((prev) => {
@@ -598,6 +996,13 @@ export function Obligations() {
         </div>
       </div>
 
+      <TabProvider value={activeTab} onUpdate={(v) => setActiveTab(v as 'obligations' | 'occurrences')}>
+        <TabList>
+          <Tab value="obligations">Obligations</Tab>
+          <Tab value="occurrences">Occurrences</Tab>
+        </TabList>
+      </TabProvider>
+
       <div className="flex justify-end gap-2">
         <Link to="/obligations/import">
           <Button view="normal">
@@ -605,16 +1010,107 @@ export function Obligations() {
             Import Spreadsheet
           </Button>
         </Link>
-        <Button onClick={() => setShowBlocked((v) => !v)}>
-          {showBlocked ? <EyeOff className="mr-2 h-4 w-4" /> : <Eye className="mr-2 h-4 w-4" />}
-          {showBlocked ? 'Hide' : 'Show'} Blocked{blockedCount > 0 ? ` (${blockedCount})` : ''}
+        <Button onClick={() => setIsGroupsModalOpen(true)}>
+          <Layers className="mr-2 h-4 w-4" />
+          Manage Groups{groups.length > 0 ? ` (${groups.length})` : ''}
         </Button>
+        {activeTab === 'obligations' && (
+          <>
+            <Button onClick={() => setShowBlocked((v) => !v)}>
+              {showBlocked ? <EyeOff className="mr-2 h-4 w-4" /> : <Eye className="mr-2 h-4 w-4" />}
+              {showBlocked ? 'Hide' : 'Show'} Blocked{blockedCount > 0 ? ` (${blockedCount})` : ''}
+            </Button>
+            <Button onClick={() => setShowPaidNested((v) => !v)}>
+              {showPaidNested ? <EyeOff className="mr-2 h-4 w-4" /> : <Eye className="mr-2 h-4 w-4" />}
+              {showPaidNested ? 'Hide' : 'Show'} Paid
+            </Button>
+          </>
+        )}
+        {activeTab === 'occurrences' && (
+          <Button onClick={() => setShowPaidOcc((v) => !v)}>
+            {showPaidOcc ? <EyeOff className="mr-2 h-4 w-4" /> : <Eye className="mr-2 h-4 w-4" />}
+            {showPaidOcc ? 'Hide' : 'Show'} Paid
+          </Button>
+        )}
         <Button view="action" onClick={openCreateModal}>
           <Plus className="mr-2 h-4 w-4" />
           New Obligation
         </Button>
       </div>
 
+      {activeTab === 'occurrences' && (
+        <div className="flex gap-3 items-end bg-card border border-border rounded-lg p-3 flex-wrap">
+          <div className="flex-1 min-w-[180px]">
+            <label className="block text-xs font-medium mb-1 text-muted-foreground">Search</label>
+            <TextInput placeholder="Name or note…" value={occSearch} onUpdate={setOccSearch} hasClear />
+          </div>
+          <div>
+            <label className="block text-xs font-medium mb-1 text-muted-foreground">Status</label>
+            <Select
+              value={[occStatusFilter]}
+              onUpdate={(val) => setOccStatusFilter((val[0] as 'all' | 'pending' | 'late') || 'all')}
+              options={[
+                { value: 'all', content: 'All (except hidden paid)' },
+                { value: 'pending', content: 'Pending' },
+                { value: 'late', content: 'Late' },
+              ]}
+              width={220}
+            />
+          </div>
+          <div>
+            <label className="block text-xs font-medium mb-1 text-muted-foreground">Type</label>
+            <Select
+              value={[occDirection]}
+              onUpdate={(val) => setOccDirection((val[0] as '' | 'payable' | 'receivable') || '')}
+              options={[{ value: '', content: '(any type)' }, ...DIRECTION_OPTIONS]}
+              width={200}
+              hasClear
+            />
+          </div>
+          <div className="min-w-[180px]">
+            <label className="block text-xs font-medium mb-1 text-muted-foreground">Category</label>
+            <Select
+              value={occCategoryId ? [occCategoryId] : []}
+              onUpdate={(val) => setOccCategoryId(val[0] || '')}
+              options={[{ value: '', content: '(any category)' }, ...categoryOptions.slice(1)]}
+              filterable
+              hasClear
+              width="max"
+            />
+          </div>
+          <div>
+            <label className="block text-xs font-medium mb-1 text-muted-foreground">Month</label>
+            <Select
+              value={[occMonth]}
+              onUpdate={(val) => setOccMonth(val[0] || '')}
+              options={MONTH_OPTIONS}
+              width={160}
+            />
+          </div>
+          <div>
+            <label className="block text-xs font-medium mb-1 text-muted-foreground">Year</label>
+            <TextInput
+              type="number"
+              placeholder="(any year)"
+              value={occYear}
+              onUpdate={setOccYear}
+              style={{ width: 120 }}
+            />
+          </div>
+        </div>
+      )}
+
+      {activeTab === 'occurrences' && selectedOccIds.size > 0 && (
+        <div className="flex justify-between items-center bg-primary/5 border border-primary/20 rounded-lg p-2 px-3">
+          <span className="text-sm font-medium">{selectedOccIds.size} selected</span>
+          <Button view="flat-danger" size="s" onClick={handleBulkDeleteOccurrences}>
+            <Trash2 className="mr-1.5 h-3.5 w-3.5" />
+            Delete Selected
+          </Button>
+        </div>
+      )}
+
+      {activeTab === 'obligations' && (
       <div className="compact-table border border-border rounded-lg overflow-hidden bg-card shadow-sm">
         <table className="w-full border-collapse text-left">
           <thead>
@@ -708,6 +1204,11 @@ export function Obligations() {
                                   </Button>
                                 </div>
                               )}
+                              {(() => {
+                                const allOccurrences = detail.occurrences || [];
+                                const visibleOccurrences = allOccurrences.filter((occ) => showPaidNested || !occ.paid);
+                                const hiddenPaidCount = allOccurrences.length - visibleOccurrences.length;
+                                return (
                               <table className="w-full border-collapse text-left">
                                 <thead>
                                   <tr className="border-b border-border/50">
@@ -722,7 +1223,7 @@ export function Obligations() {
                                   </tr>
                                 </thead>
                                 <tbody>
-                                  {(detail.occurrences || []).map((occ) => (
+                                  {visibleOccurrences.map((occ) => (
                                     <tr key={occ.obligation_occurrence_id} className="border-b border-border/20" style={{ opacity: occ.is_blocked ? 0.7 : 1 }}>
                                       <td className="py-1 px-2 text-sm">{occ.due_date ? formatDate(occ.due_date, defaultLocale) : '—'}</td>
                                       <td className="py-1 px-2 text-sm text-right">{formatAmount(occ.estimated_amount, defaultCurrencySymbol, defaultLocale)}</td>
@@ -748,6 +1249,9 @@ export function Obligations() {
                                       <td className="py-1 px-2 text-sm text-muted-foreground">{occ.note || ''}</td>
                                       <td className="py-1 px-2">
                                         <div className="flex justify-center items-center gap-1">
+                                          <Button view="flat" size="s" title="Edit" onClick={() => openEditOccDialog(occ, detail)}>
+                                            <Edit2 className="h-4 w-4" />
+                                          </Button>
                                           <Button view="flat" size="s" title="Assign Transactions" onClick={() => openAssignDialog(occ)}>
                                             <Link2 className="h-4 w-4" />
                                           </Button>
@@ -763,13 +1267,19 @@ export function Obligations() {
                                       </td>
                                     </tr>
                                   ))}
-                                  {(detail.occurrences || []).length === 0 && (
+                                  {visibleOccurrences.length === 0 && (
                                     <tr>
-                                      <td colSpan={8} className="py-3 text-center text-sm text-muted-foreground">No occurrences.</td>
+                                      <td colSpan={8} className="py-3 text-center text-sm text-muted-foreground">
+                                        {allOccurrences.length === 0
+                                          ? 'No occurrences.'
+                                          : `All ${hiddenPaidCount} occurrence(s) are paid — click "Show Paid" to see them.`}
+                                      </td>
                                     </tr>
                                   )}
                                 </tbody>
                               </table>
+                                );
+                              })()}
                             </div>
                           )}
                         </td>
@@ -782,6 +1292,94 @@ export function Obligations() {
           </tbody>
         </table>
       </div>
+      )}
+
+      {activeTab === 'occurrences' && (
+        <div className="compact-table border border-border rounded-lg overflow-hidden bg-card shadow-sm">
+          <table className="w-full border-collapse text-left">
+            <thead>
+              <tr className="bg-muted/30 border-b border-border">
+                <th className="py-1 px-3 w-8">
+                  {occurrences.length > 0 && (
+                    <Checkbox
+                      checked={selectedOccIds.size === occurrences.length}
+                      indeterminate={selectedOccIds.size > 0 && selectedOccIds.size < occurrences.length}
+                      onUpdate={toggleAllOccSelected}
+                    />
+                  )}
+                </th>
+                <th className="py-1 px-3 text-base font-bold text-black">Month/Year</th>
+                <th className="py-1 px-3 text-base font-bold text-black">Name</th>
+                <th className="py-1 px-3 text-base font-bold text-black">Category</th>
+                <th className="py-1 px-3 text-base font-bold text-black">Type</th>
+                <th className="py-1 px-3 text-base font-bold text-black">Due</th>
+                <th className="py-1 px-3 text-base font-bold text-black text-center">Status</th>
+                <th className="py-1 px-3 text-base font-bold text-black text-center">Paid</th>
+                <th className="py-1 px-3 text-base font-bold text-black">Paid Date</th>
+                <th className="py-1 px-3 text-base font-bold text-black">Note</th>
+                <th className="py-1 px-3 text-base font-bold text-black w-36 text-center">Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {occLoading && occurrences.length === 0 ? (
+                <tr>
+                  <td colSpan={11} className="py-8 text-center text-muted-foreground">Loading occurrences...</td>
+                </tr>
+              ) : occurrences.length === 0 ? (
+                <tr>
+                  <td colSpan={11} className="py-8 text-center text-muted-foreground">No occurrences match these filters.</td>
+                </tr>
+              ) : (
+                occurrences.map((occ, idx) => (
+                  <tr
+                    key={occ.obligation_occurrence_id}
+                    className={`border-b border-border/50 ${idx % 2 === 1 ? 'bg-muted/40' : ''}`}
+                    style={{ opacity: occ.is_blocked ? 0.7 : 1 }}
+                  >
+                    <td className="py-1 px-3 text-center">
+                      <Checkbox
+                        checked={selectedOccIds.has(occ.obligation_occurrence_id)}
+                        onUpdate={() => toggleOccSelected(occ.obligation_occurrence_id)}
+                      />
+                    </td>
+                    <td className="py-1 px-3 text-sm text-muted-foreground">{occ.period || '—'}</td>
+                    <td className="py-1 px-3 text-sm font-medium text-foreground">{occ.obligation_name}</td>
+                    <td className="py-1 px-3 text-sm text-muted-foreground">{occ.category_name || '—'}</td>
+                    <td className="py-1 px-3 text-sm text-muted-foreground">{occ.direction === 'receivable' ? 'Receivable' : 'Payable'}</td>
+                    <td className="py-1 px-3 text-sm">{occ.due_date ? formatDate(occ.due_date, defaultLocale) : '—'}</td>
+                    <td className="py-1 px-3 text-center"><StatusBadge occ={occ} /></td>
+                    <td className="py-1 px-3 text-center">
+                      <Checkbox checked={occ.paid} onUpdate={() => handleTogglePaid(occ)} />
+                    </td>
+                    <td className="py-1 px-3">
+                      <input
+                        type="date"
+                        className="border rounded p-1 text-xs bg-background text-foreground w-full"
+                        value={occ.paid_date || ''}
+                        onChange={(e) => handleUpdatePaidDate(occ, e.target.value)}
+                      />
+                    </td>
+                    <td className="py-1 px-3 text-sm text-muted-foreground">{occ.note || ''}</td>
+                    <td className="py-1 px-3">
+                      <div className="flex justify-center items-center gap-1">
+                        <Button view="flat" size="s" title="Edit" onClick={() => openEditOccDialog(occ)}>
+                          <Edit2 className="h-4 w-4" />
+                        </Button>
+                        <Button view="flat" size="s" title="Assign Transactions" onClick={() => openAssignDialog(occ)}>
+                          <Link2 className="h-4 w-4" />
+                        </Button>
+                        <Button view="flat-danger" size="s" title="Delete" onClick={() => handleDeleteOccurrence(occ)}>
+                          <Trash2 className="h-4 w-4" />
+                        </Button>
+                      </div>
+                    </td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+      )}
 
       {/* Create / Edit modal */}
       <Dialog open={isModalOpen} onClose={closeModal}>
@@ -815,6 +1413,19 @@ export function Obligations() {
                 options={payeeOptions}
                 filterable
                 width="max"
+              />
+            </div>
+            <div>
+              <label className="block text-sm font-medium mb-1">
+                Group (optional) <span className="text-muted-foreground font-normal">— shares a recurring template across separate imports</span>
+              </label>
+              <Select
+                value={formData.obligation_group_id ? [String(formData.obligation_group_id)] : ['']}
+                onUpdate={(val) => setFormData({ ...formData, obligation_group_id: val[0] || '' })}
+                options={groupOptions}
+                filterable
+                width="max"
+                hasClear
               />
             </div>
             <div>
@@ -929,12 +1540,70 @@ export function Obligations() {
                 </div>
               )}
 
+              <div className="bg-muted/20 border border-border rounded p-2 space-y-2">
+                <div className="text-sm font-semibold">Can't find it? Search beyond the suggestions</div>
+                <div className="flex gap-2 items-end flex-wrap">
+                  <div className="flex-1 min-w-[160px]">
+                    <label className="block text-xs text-muted-foreground mb-1">Comment or payee</label>
+                    <TextInput
+                      value={searchForm.text}
+                      onUpdate={(val) => setSearchForm({ ...searchForm, text: val })}
+                      placeholder="e.g. refund"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs text-muted-foreground mb-1">Min amount</label>
+                    <TextInput
+                      type="number"
+                      value={searchForm.minAmount}
+                      onUpdate={(val) => setSearchForm({ ...searchForm, minAmount: val })}
+                      style={{ width: 100 }}
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs text-muted-foreground mb-1">Max amount</label>
+                    <TextInput
+                      type="number"
+                      value={searchForm.maxAmount}
+                      onUpdate={(val) => setSearchForm({ ...searchForm, maxAmount: val })}
+                      style={{ width: 100 }}
+                    />
+                  </div>
+                  <Checkbox
+                    checked={searchForm.allTime}
+                    onUpdate={(checked) => setSearchForm({ ...searchForm, allTime: checked })}
+                  >
+                    Any date
+                  </Checkbox>
+                  <Checkbox
+                    checked={searchForm.ignoreDirection}
+                    onUpdate={(checked) => setSearchForm({ ...searchForm, ignoreDirection: checked })}
+                  >
+                    Any type (in or out)
+                  </Checkbox>
+                  <Button view="action" size="s" loading={searchingCandidates} onClick={handleSearchCandidates}>
+                    Search
+                  </Button>
+                  {assignDialog.searching && (
+                    <Button view="flat" size="s" onClick={handleResetCandidateSearch}>
+                      Reset to Suggested
+                    </Button>
+                  )}
+                </div>
+              </div>
+
               <div>
-                <div className="text-sm font-semibold mb-1">Candidates</div>
+                <div className="text-sm font-semibold mb-1">
+                  {assignDialog.searching ? 'Search Results' : 'Candidates'}
+                </div>
                 {assignDialog.loading ? (
                   <div className="text-sm text-muted-foreground py-4 text-center">Loading candidates...</div>
                 ) : assignDialog.candidates.length === 0 ? (
-                  <div className="text-sm text-muted-foreground py-4 text-center">No candidate transactions found in the default date window.</div>
+                  <div className="text-sm text-muted-foreground py-4 text-center">
+                    {assignDialog.searching
+                      ? 'No transactions match this search.'
+                      : 'No candidate transactions found in the default date window.'}
+                  </div>
                 ) : (
                   <div className="border border-border rounded divide-y divide-border/50 max-h-80 overflow-y-auto">
                     {assignDialog.candidates.map((tx) => (
@@ -963,6 +1632,249 @@ export function Obligations() {
           textButtonApply="Assign Selected"
           textButtonCancel="Close"
           propsButtonApply={{ disabled: !assignDialog || assignDialog.selected.size === 0 }}
+        />
+      </Dialog>
+
+      {/* Groups management modal */}
+      <Dialog open={isGroupsModalOpen} onClose={() => setIsGroupsModalOpen(false)} size="l">
+        <Dialog.Header caption="Obligation Groups" />
+        <Dialog.Body>
+          <div className="space-y-3 pt-2">
+            <p className="text-sm text-muted-foreground">
+              A group is a reusable recurring-bill template (name, category, type, cadence). Separate obligations
+              (e.g. one per import) can link to the same group instead of each carrying its own copy of these
+              settings — editing a group never changes obligations already linked to it; use "Sync" to push the
+              group's current settings down on demand.
+            </p>
+            <div className="flex justify-end">
+              <Button view="action" size="s" onClick={openCreateGroupForm}>
+                <Plus className="mr-1.5 h-3.5 w-3.5" />
+                New Group
+              </Button>
+            </div>
+            <div className="border border-border rounded divide-y divide-border/50 max-h-96 overflow-y-auto">
+              {groups.length === 0 ? (
+                <div className="text-sm text-muted-foreground py-4 text-center">No groups yet.</div>
+              ) : (
+                groups.map((g) => (
+                  <div key={g.obligation_group_id} className="flex justify-between items-center px-3 py-2 text-sm">
+                    <div>
+                      <div className="font-medium text-foreground">{g.name}</div>
+                      <div className="text-xs text-muted-foreground">
+                        {g.category_name || 'No category'} · {g.direction === 'receivable' ? 'Receivable' : 'Payable'}
+                        {g.recurrence ? ` · ${g.recurrence}` : ''}
+                        {g.expected_day_of_month ? ` · day ${g.expected_day_of_month}` : ''}
+                        {g.expected_weekday ? ` · ${g.expected_weekday}` : ''}
+                        {' · '}{g.obligation_count} linked obligation{g.obligation_count === 1 ? '' : 's'}
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-1">
+                      <Button
+                        view="flat"
+                        size="s"
+                        title="Sync group settings to its obligations"
+                        onClick={() => handleSyncGroup(g)}
+                        disabled={g.obligation_count === 0}
+                      >
+                        Sync
+                      </Button>
+                      <Button view="flat" size="s" title="Edit" onClick={() => openEditGroupForm(g)}>
+                        <Edit2 className="h-4 w-4" />
+                      </Button>
+                      <Button view="flat-danger" size="s" title="Delete" onClick={() => handleDeleteGroup(g)}>
+                        <Trash2 className="h-4 w-4" />
+                      </Button>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        </Dialog.Body>
+        <Dialog.Footer preset="default" onClickButtonCancel={() => setIsGroupsModalOpen(false)} textButtonCancel="Close" />
+      </Dialog>
+
+      {/* Group create/edit sub-form */}
+      <Dialog open={isGroupFormOpen} onClose={closeGroupForm}>
+        <Dialog.Header caption={editingGroup ? 'Edit Group' : 'New Group'} />
+        <Dialog.Body>
+          <div className="space-y-4 pt-2">
+            <div>
+              <label className="block text-sm font-medium mb-1">Name</label>
+              <TextInput value={groupFormData.name} onUpdate={(val) => setGroupFormData({ ...groupFormData, name: val })} />
+            </div>
+            <div>
+              <label className="block text-sm font-medium mb-1">Category</label>
+              <Select
+                value={groupFormData.category_id ? [String(groupFormData.category_id)] : ['']}
+                onUpdate={(val) => setGroupFormData({ ...groupFormData, category_id: val[0] || '' })}
+                options={categoryOptions}
+                filterable
+                width="max"
+              />
+            </div>
+            <div>
+              <label className="block text-sm font-medium mb-1">Type</label>
+              <Select
+                value={[groupFormData.direction]}
+                onUpdate={(val) => setGroupFormData({ ...groupFormData, direction: (val[0] as 'payable' | 'receivable') || 'payable' })}
+                options={DIRECTION_OPTIONS}
+                width="max"
+              />
+            </div>
+            <div className="flex gap-3 items-end">
+              <Checkbox
+                checked={groupFormData.is_recurring}
+                onUpdate={(checked) => setGroupFormData({ ...groupFormData, is_recurring: checked })}
+              >
+                Recurring
+              </Checkbox>
+              {groupFormData.is_recurring && (
+                <Select
+                  value={[groupFormData.recurrence]}
+                  onUpdate={(val) => setGroupFormData({ ...groupFormData, recurrence: val[0] || 'monthly' })}
+                  options={RECURRENCE_OPTIONS}
+                  width={160}
+                />
+              )}
+            </div>
+            {groupFormData.is_recurring && groupFormData.recurrence === 'monthly' && (
+              <div>
+                <label className="block text-sm font-medium mb-1">Expected day of month (optional)</label>
+                <TextInput
+                  type="number"
+                  placeholder="e.g. 15"
+                  value={groupFormData.expected_day_of_month}
+                  onUpdate={(val) => setGroupFormData({ ...groupFormData, expected_day_of_month: val })}
+                />
+              </div>
+            )}
+            {groupFormData.is_recurring && groupFormData.recurrence === 'weekly' && (
+              <div>
+                <label className="block text-sm font-medium mb-1">Expected weekday (optional)</label>
+                <Select
+                  value={groupFormData.expected_weekday ? [groupFormData.expected_weekday] : ['']}
+                  onUpdate={(val) => setGroupFormData({ ...groupFormData, expected_weekday: val[0] || '' })}
+                  options={[
+                    { value: '', content: '(none)' },
+                    ...['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'].map((d) => ({
+                      value: d,
+                      content: d.charAt(0).toUpperCase() + d.slice(1),
+                    })),
+                  ]}
+                  width={200}
+                />
+              </div>
+            )}
+          </div>
+        </Dialog.Body>
+        <Dialog.Footer
+          preset="default"
+          onClickButtonCancel={closeGroupForm}
+          onClickButtonApply={handleGroupSubmit}
+          textButtonApply={editingGroup ? 'Update' : 'Create'}
+          textButtonCancel="Cancel"
+        />
+      </Dialog>
+
+      {/* Edit Occurrence modal -- name/category/type/group edit the parent Obligation */}
+      <Dialog open={!!editOccDialog} onClose={closeEditOccDialog}>
+        <Dialog.Header caption="Edit Occurrence" />
+        <Dialog.Body>
+          {editOccDialog && (
+            <div className="space-y-4 pt-2">
+              <p className="text-xs text-muted-foreground">
+                Name, category, type and group are shared with every other occurrence of this obligation — changing
+                them here changes the obligation itself, not just this one.
+              </p>
+              <div>
+                <label className="block text-sm font-medium mb-1">Name</label>
+                <TextInput value={occFormData.name} onUpdate={(val) => setOccFormData({ ...occFormData, name: val })} />
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Category</label>
+                <Select
+                  value={occFormData.category_id ? [String(occFormData.category_id)] : ['']}
+                  onUpdate={(val) => setOccFormData({ ...occFormData, category_id: val[0] || '' })}
+                  options={categoryOptions}
+                  filterable
+                  width="max"
+                />
+              </div>
+              <div className="flex gap-2">
+                <div className="flex-1">
+                  <label className="block text-sm font-medium mb-1">Type</label>
+                  <Select
+                    value={[occFormData.direction]}
+                    onUpdate={(val) => setOccFormData({ ...occFormData, direction: (val[0] as 'payable' | 'receivable') || 'payable' })}
+                    options={DIRECTION_OPTIONS}
+                    width="max"
+                  />
+                </div>
+                <div className="flex-1">
+                  <label className="block text-sm font-medium mb-1">Group</label>
+                  <Select
+                    value={occFormData.obligation_group_id ? [String(occFormData.obligation_group_id)] : ['']}
+                    onUpdate={(val) => setOccFormData({ ...occFormData, obligation_group_id: val[0] || '' })}
+                    options={groupOptions}
+                    filterable
+                    hasClear
+                    width="max"
+                  />
+                </div>
+              </div>
+              <div className="flex gap-2">
+                <div className="flex-1">
+                  <label className="block text-sm font-medium mb-1">Due Date</label>
+                  <input
+                    type="date"
+                    className="border rounded p-1.5 text-sm bg-background text-foreground w-full"
+                    value={occFormData.due_date}
+                    onChange={(e) => setOccFormData({ ...occFormData, due_date: e.target.value })}
+                  />
+                </div>
+                <div className="flex-1">
+                  <label className="block text-sm font-medium mb-1">Month/Year</label>
+                  <input
+                    type="month"
+                    className="border rounded p-1.5 text-sm bg-background text-foreground w-full"
+                    value={occFormData.period}
+                    onChange={(e) => setOccFormData({ ...occFormData, period: e.target.value })}
+                  />
+                </div>
+              </div>
+              <div className="flex gap-2">
+                <div className="flex-1">
+                  <label className="block text-sm font-medium mb-1">Value</label>
+                  <TextInput
+                    type="number"
+                    value={occFormData.estimated_amount}
+                    onUpdate={(val) => setOccFormData({ ...occFormData, estimated_amount: val })}
+                  />
+                </div>
+                <div className="flex-1">
+                  <label className="block text-sm font-medium mb-1">Paid Date</label>
+                  <input
+                    type="date"
+                    className="border rounded p-1.5 text-sm bg-background text-foreground w-full"
+                    value={occFormData.paid_date}
+                    onChange={(e) => setOccFormData({ ...occFormData, paid_date: e.target.value })}
+                  />
+                </div>
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Note</label>
+                <TextInput value={occFormData.note} onUpdate={(val) => setOccFormData({ ...occFormData, note: val })} />
+              </div>
+            </div>
+          )}
+        </Dialog.Body>
+        <Dialog.Footer
+          preset="default"
+          onClickButtonCancel={closeEditOccDialog}
+          onClickButtonApply={handleEditOccSubmit}
+          textButtonApply="Save"
+          textButtonCancel="Cancel"
         />
       </Dialog>
     </div>

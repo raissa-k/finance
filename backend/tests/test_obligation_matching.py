@@ -117,7 +117,7 @@ def _setup_account_and_payee(client):
     return acc_id, payee_id
 
 
-def _create_tx(client, acc_id, payee_id, amount, cash_date, transaction_type="withdrawal"):
+def _create_tx(client, acc_id, payee_id, amount, cash_date, transaction_type="withdrawal", comment=None, category_id=None):
     res = client.post(
         "/api/transactions/",
         json={
@@ -126,6 +126,8 @@ def _create_tx(client, acc_id, payee_id, amount, cash_date, transaction_type="wi
             "transactionType": transaction_type,
             "payee_id": payee_id,
             "cash": cash_date,
+            "comment": comment,
+            "category_id": category_id,
         },
     )
     assert res.status_code == 201
@@ -230,3 +232,99 @@ def test_import_apply_does_not_auto_match_ambiguous_candidates(client):
     ob_id = res.json()["obligation_ids"][0]
     occ = client.get(f"/api/obligations/{ob_id}/").json()["occurrences"][0]
     assert occ["assigned_transaction_count"] == 0
+
+
+# ── candidate-transactions search flexibility (widening beyond suggestions) ──
+
+
+def _create_occurrence(client, name, direction="payable", first_due_date="2026-08-05", estimated_amount=100.0):
+    res = client.post(
+        "/api/obligations/",
+        json={
+            "name": name,
+            "direction": direction,
+            "estimated_amount": estimated_amount,
+            "first_due_date": first_due_date,
+        },
+    )
+    return res.json()["occurrences"][0]["obligation_occurrence_id"]
+
+
+def test_candidate_transactions_default_excludes_outside_window(client):
+    acc_id, payee_id = _setup_account_and_payee(client)
+    occ_id = _create_occurrence(client, "Far Bill")
+    _create_tx(client, acc_id, payee_id, 100.0, "2026-01-01", "withdrawal")  # far outside default window
+
+    res = client.get(f"/api/obligation-occurrences/{occ_id}/candidate-transactions/")
+    assert res.json()["count"] == 0
+
+
+def test_candidate_transactions_all_time_finds_outside_window(client):
+    acc_id, payee_id = _setup_account_and_payee(client)
+    occ_id = _create_occurrence(client, "Far Bill 2")
+    tx_id = _create_tx(client, acc_id, payee_id, 100.0, "2026-01-01", "withdrawal")
+
+    res = client.get(f"/api/obligation-occurrences/{occ_id}/candidate-transactions/?all_time=true")
+    ids = [t["transaction_id"] for t in res.json()["results"]]
+    assert tx_id in ids
+
+
+def test_candidate_transactions_search_finds_by_comment(client):
+    acc_id, payee_id = _setup_account_and_payee(client)
+    occ_id = _create_occurrence(client, "Searchable Bill")
+    tx_id = _create_tx(client, acc_id, payee_id, 100.0, "2026-01-01", "withdrawal", comment="unusual refund note")
+
+    res_default = client.get(f"/api/obligation-occurrences/{occ_id}/candidate-transactions/")
+    assert tx_id not in [t["transaction_id"] for t in res_default.json()["results"]]
+
+    res_search = client.get(
+        f"/api/obligation-occurrences/{occ_id}/candidate-transactions/?all_time=true&search=unusual"
+    )
+    assert tx_id in [t["transaction_id"] for t in res_search.json()["results"]]
+
+
+def test_candidate_transactions_ignore_direction_includes_wrong_sign(client):
+    acc_id, payee_id = _setup_account_and_payee(client)
+    occ_id = _create_occurrence(client, "Payable Bill", direction="payable")
+    tx_id = _create_tx(client, acc_id, payee_id, 100.0, "2026-08-04", "deposit")  # wrong sign for payable
+
+    res_default = client.get(f"/api/obligation-occurrences/{occ_id}/candidate-transactions/")
+    assert tx_id not in [t["transaction_id"] for t in res_default.json()["results"]]
+
+    res_ignore = client.get(f"/api/obligation-occurrences/{occ_id}/candidate-transactions/?ignore_direction=true")
+    assert tx_id in [t["transaction_id"] for t in res_ignore.json()["results"]]
+
+
+def test_candidate_transactions_min_max_amount_filters(client):
+    acc_id, payee_id = _setup_account_and_payee(client)
+    occ_id = _create_occurrence(client, "Amount Filter Bill")
+    small_tx = _create_tx(client, acc_id, payee_id, 10.0, "2026-08-04", "withdrawal")
+    big_tx = _create_tx(client, acc_id, payee_id, 900.0, "2026-08-04", "withdrawal")
+
+    res = client.get(f"/api/obligation-occurrences/{occ_id}/candidate-transactions/?min_amount=500")
+    ids = [t["transaction_id"] for t in res.json()["results"]]
+    assert big_tx in ids
+    assert small_tx not in ids
+
+    res2 = client.get(f"/api/obligation-occurrences/{occ_id}/candidate-transactions/?max_amount=50")
+    ids2 = [t["transaction_id"] for t in res2.json()["results"]]
+    assert small_tx in ids2
+    assert big_tx not in ids2
+
+
+def test_candidate_transactions_search_mode_skips_soft_category_narrowing(client):
+    # Regression guard: when NOT searching, soft category narrowing already
+    # applies (covered elsewhere); when searching, it must NOT silently
+    # exclude a transaction with a different (or no) category.
+    acc_id, payee_id = _setup_account_and_payee(client)
+    cat_id = _create_category(client, "MatchingCat")
+    occ_id = _create_occurrence(client, "Category Search Bill")
+    # Give the obligation a category so soft-narrowing would normally kick in.
+    ob_id = client.get(f"/api/obligation-occurrences/{occ_id}/").json()["obligation_id"]
+    client.put(f"/api/obligations/{ob_id}/", json={"name": "Category Search Bill", "category_id": cat_id})
+
+    other_cat_id = _create_category(client, "OtherCat")
+    tx_id = _create_tx(client, acc_id, payee_id, 100.0, "2026-01-01", "withdrawal", category_id=other_cat_id)
+
+    res = client.get(f"/api/obligation-occurrences/{occ_id}/candidate-transactions/?all_time=true")
+    assert tx_id in [t["transaction_id"] for t in res.json()["results"]]

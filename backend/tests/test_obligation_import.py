@@ -43,12 +43,14 @@ def test_preview_upload(client):
     )
     assert res.status_code == 200
     data = res.json()
-    assert data["summary"]["new"] == 2
-    assert data["summary"]["duplicates"] == 0
+    assert data["summary"]["new_obligations"] == 2
+    assert data["summary"]["attached_obligations"] == 0
+    assert data["summary"]["new_occurrences"] == 2
+    assert data["summary"]["duplicate_occurrences"] == 0
     assert "Housing" in data["unmatched_categories"]
 
 
-def test_apply_upload_creates_obligations_then_flags_reimport_as_duplicates(client):
+def test_apply_upload_creates_obligations_then_attaches_reimport_blocking_conflicts(client):
     res = client.post(
         "/api/obligation-import/apply/",
         files={"file": ("obligations_sample.csv", _read_fixture(), "text/csv")},
@@ -57,9 +59,15 @@ def test_apply_upload_creates_obligations_then_flags_reimport_as_duplicates(clie
     assert res.status_code == 200
     data = res.json()
     assert data["created"] == 2
-    assert data["blocked"] == 0
+    assert data["attached"] == 0
+    assert data["occurrences_created"] == 2
+    assert data["occurrences_blocked"] == 0
     assert len(data["obligation_ids"]) == 2
 
+    # Re-importing the EXACT same file: both bills already exist, so this
+    # attaches to them (no new Obligation rows) -- but every occurrence has
+    # the same due date as before, so all of them individually conflict and
+    # get blocked rather than silently duplicated.
     res2 = client.post(
         "/api/obligation-import/apply/",
         files={"file": ("obligations_sample.csv", _read_fixture(), "text/csv")},
@@ -68,7 +76,10 @@ def test_apply_upload_creates_obligations_then_flags_reimport_as_duplicates(clie
     assert res2.status_code == 200
     data2 = res2.json()
     assert data2["created"] == 0
-    assert data2["blocked"] == 2
+    assert data2["attached"] == 2
+    assert data2["occurrences_created"] == 0
+    assert data2["occurrences_blocked"] == 2
+    assert sorted(data2["obligation_ids"]) == sorted(data["obligation_ids"])  # same obligations, not new ones
 
 
 def test_preview_groups_same_bill_rows_into_one_obligation(client):
@@ -87,8 +98,10 @@ def test_preview_groups_same_bill_rows_into_one_obligation(client):
     )
     assert res.status_code == 200
     data = res.json()
-    assert data["summary"]["new"] == 1  # one obligation group, not three
-    assert data["summary"]["duplicates"] == 0
+    assert data["summary"]["new_obligations"] == 1  # one obligation group, not three
+    assert data["summary"]["attached_obligations"] == 0
+    assert data["summary"]["new_occurrences"] == 3
+    assert data["summary"]["duplicate_occurrences"] == 0
     assert len(data["rows"]) == 3  # still one preview row per occurrence
     assert all(not r["is_duplicate"] for r in data["rows"])
     assert all(r["is_recurring"] for r in data["rows"])
@@ -109,7 +122,9 @@ def test_apply_groups_same_bill_rows_into_one_obligation_with_occurrences(client
     assert res.status_code == 200
     data = res.json()
     assert data["created"] == 1
-    assert data["blocked"] == 0
+    assert data["attached"] == 0
+    assert data["occurrences_created"] == 3
+    assert data["occurrences_blocked"] == 0
     assert len(data["obligation_ids"]) == 1
 
     ob_id = data["obligation_ids"][0]
@@ -121,6 +136,64 @@ def test_apply_groups_same_bill_rows_into_one_obligation_with_occurrences(client
     assert not ob["is_blocked"]
     due_dates = sorted(o["due_date"] for o in ob["occurrences"])
     assert due_dates == ["2026-08-15", "2026-09-15", "2026-10-15"]
+    assert all(not o["is_blocked"] for o in ob["occurrences"])
+
+
+def test_reimporting_same_bill_with_non_overlapping_months_is_not_a_duplicate(client):
+    """Regression test: re-importing "Salário" a year later, entirely
+    different months, was falsely flagging every new row as a Duplicate --
+    because dedup only checked (name, category), never each row's own
+    period against what's actually already there. New, non-conflicting
+    occurrences must show as New in preview and attach cleanly on apply."""
+    first_year = (
+        "Name,Amount,DueDate,Category\n"
+        "Salário,3000,2026-01-05,Renda\n"
+        "Salário,3000,2026-02-05,Renda\n"
+    ).encode("utf-8")
+    res1 = client.post(
+        "/api/obligation-import/apply/",
+        files={"file": ("y1.csv", first_year, "text/csv")},
+        data={"format_json": _FORMAT_JSON},
+    )
+    assert res1.status_code == 200
+    assert res1.json()["created"] == 1
+    ob_id = res1.json()["obligation_ids"][0]
+
+    second_year = (
+        "Name,Amount,DueDate,Category\n"
+        "Salário,3100,2027-01-05,Renda\n"
+        "Salário,3100,2027-02-05,Renda\n"
+        "Salário,3100,2027-03-05,Renda\n"
+    ).encode("utf-8")
+    res_preview = client.post(
+        "/api/obligation-import/preview/",
+        files={"file": ("y2.csv", second_year, "text/csv")},
+        data={"format_json": _FORMAT_JSON},
+    )
+    assert res_preview.status_code == 200
+    preview = res_preview.json()
+    assert preview["summary"]["new_obligations"] == 0
+    assert preview["summary"]["attached_obligations"] == 1
+    assert preview["summary"]["new_occurrences"] == 3
+    assert preview["summary"]["duplicate_occurrences"] == 0
+    assert all(not r["is_duplicate"] for r in preview["rows"])  # the reported bug
+
+    res_apply = client.post(
+        "/api/obligation-import/apply/",
+        files={"file": ("y2.csv", second_year, "text/csv")},
+        data={"format_json": _FORMAT_JSON},
+    )
+    assert res_apply.status_code == 200
+    apply_data = res_apply.json()
+    assert apply_data["created"] == 0
+    assert apply_data["attached"] == 1
+    assert apply_data["occurrences_created"] == 3
+    assert apply_data["occurrences_blocked"] == 0
+    assert apply_data["obligation_ids"] == [ob_id]  # attached to the SAME obligation, not a new one
+
+    ob = client.get(f"/api/obligations/{ob_id}/").json()
+    assert not ob["is_blocked"]
+    assert ob["occurrence_count"] == 5  # 2 from year 1 + 3 from year 2, none blocked
     assert all(not o["is_blocked"] for o in ob["occurrences"])
 
 
